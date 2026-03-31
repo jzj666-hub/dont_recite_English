@@ -56,6 +56,7 @@ class AIChatWindow(QDialog):
         self.input_stack.addWidget(self.input_preview)
         self.input_stack.addWidget(self.input_edit)
         self.input_stack.setCurrentWidget(self.input_edit)
+        self.apply_input_styles()
         input_row.addWidget(self.input_host, 1)
         self.send_btn = QPushButton("发送")
         self.send_btn.setFixedWidth(88)
@@ -66,6 +67,28 @@ class AIChatWindow(QDialog):
         self.chat_result_ready.connect(self.on_chat_result)
         if initial_prompt:
             self.send_message(initial_prompt, payload_text=initial_payload or initial_prompt)
+
+    def apply_input_styles(self):
+        theme = self.app.settings.get('theme', 'dark')
+        if theme == 'light':
+            bg = '#ffffff'
+            border = '#cccccc'
+            text = '#000000'
+            preview_bg = '#fafafa'
+        else:
+            bg = '#1e1e1e'
+            border = '#3d3d3d'
+            text = '#ffffff'
+            preview_bg = '#2b2b2b'
+        self.input_edit.setStyleSheet(
+            f"QTextEdit{{background-color:{bg};border:1px solid {border};border-radius:6px;color:{text};padding:6px;}}"
+        )
+        self.input_preview.setStyleSheet(
+            f"QTextBrowser{{background-color:{preview_bg};border:1px solid {border};border-radius:6px;color:{text};padding:6px;}}"
+        )
+        self.chat_view.setStyleSheet(
+            f"QTextBrowser{{background-color:{bg};border:1px solid {border};border-radius:6px;color:{text};padding:6px;}}"
+        )
 
     def markdown_to_html(self, text):
         doc = QTextDocument()

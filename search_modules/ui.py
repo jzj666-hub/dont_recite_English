@@ -281,10 +281,33 @@ class UIMixin:
         if not hasattr(self, 'colors'):
             self.colors = self.compute_theme_colors(self.settings.get('theme', 'dark'))
         c = self.colors
+        
+        # 通用输入框样式 - 应用到所有输入相关组件
+        input_style = f"""
+            QLineEdit, QTextEdit, QTextBrowser, QComboBox {{
+                background-color: {c['widget_bg']};
+                border: 2px solid {c['border']};
+                border-radius: 8px;
+                color: {c['text']};
+                padding: 8px 12px;
+                selection-background-color: {c['accent']};
+                selection-color: {c['accent_text']};
+            }}
+            QLineEdit:focus, QTextEdit:focus, QTextBrowser:focus, QComboBox:focus {{
+                border: 2px solid {c['accent']};
+            }}
+            QLineEdit:hover, QTextEdit:hover, QTextBrowser:hover, QComboBox:hover {{
+                border: 2px solid {c['accent']};
+            }}
+            QLineEdit:disabled, QTextEdit:disabled, QTextBrowser:disabled, QComboBox:disabled {{
+                background-color: {c['bg_alt']};
+                color: {c['text_muted']};
+            }}
+        """
+        
+        # 应用通用样式到所有输入组件
         if hasattr(self, 'search_input'):
-            self.search_input.setStyleSheet(
-                f"QLineEdit{{background-color:{c['widget_bg']};border:2px solid {c['border']};border-radius:8px;padding:15px;color:{c['text']};font-size:14px;}}QLineEdit:focus{{border:2px solid {c['accent']};}}"
-            )
+            self.search_input.setStyleSheet(input_style)
         if hasattr(self, 'candidates_list'):
             self.candidates_list.setStyleSheet(
                 f"QListWidget{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:5px;}}QListWidget::item{{padding:8px;border-bottom:1px solid {c['bg_alt']};}}QListWidget::item:hover{{background-color:{c['bg_alt']};}}QListWidget::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
@@ -300,14 +323,10 @@ class UIMixin:
                 f"QListWidget{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:5px;}}QListWidget::item{{padding:6px;}}QListWidget::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
             )
         if hasattr(self, 'note_edit'):
-            self.note_edit.setStyleSheet(
-                f"QTextEdit{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:6px;color:{c['text']};padding:8px;}}QScrollBar:vertical{{background:{c['bg_alt']};width:12px;margin:0px;}}QScrollBar::handle:vertical{{background:{c['accent']};min-height:20px;border-radius:6px;}}"
-            )
+            self.note_edit.setStyleSheet(input_style)
             self.note_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         if hasattr(self, 'note_preview'):
-            self.note_preview.setStyleSheet(
-                f"QTextBrowser{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:6px;color:{c['text']};padding:8px;}}QScrollBar:vertical{{background:{c['bg_alt']};width:12px;margin:0px;}}QScrollBar::handle:vertical{{background:{c['accent']};min-height:20px;border-radius:6px;}}"
-            )
+            self.note_preview.setStyleSheet(input_style)
             self.note_preview.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         if hasattr(self, 'ai_options_list'):
             self.ai_options_list.setStyleSheet(
@@ -330,15 +349,19 @@ class UIMixin:
                 f"QListWidget{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:5px;}}QListWidget::item{{padding:8px;border-bottom:1px solid {c['bg_alt']};}}QListWidget::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
             )
         if hasattr(self, 'inner_dialog_editor'):
-            self.inner_dialog_editor.setStyleSheet(
-                f"QTextEdit{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:8px;}}"
-            )
+            self.inner_dialog_editor.setStyleSheet(input_style)
         if hasattr(self, 'inner_tool_title'):
             self.inner_tool_title.setStyleSheet(f"color:{c['accent']};font-weight:600;")
 
     def open_settings_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("设置")
+        
+        # 应用当前主题到对话框
+        if hasattr(self, 'colors'):
+            c = self.colors
+            dlg.setStyleSheet(f"QDialog {{ background-color: {c['bg']}; color: {c['text']}; }}")
+        
         form = QFormLayout()
         theme_combo = QComboBox()
         theme_combo.addItems(["深色", "浅色"])
@@ -352,6 +375,33 @@ class UIMixin:
         model_mid_edit.setText(self.get_mid_model_name())
         model_high_edit = QLineEdit()
         model_high_edit.setText(self.get_high_model_name())
+        
+        # 应用统一的输入框样式
+        if hasattr(self, 'colors'):
+            c = self.colors
+            input_style = f"""
+                QLineEdit, QTextEdit, QTextBrowser, QComboBox {{
+                    background-color: {c['widget_bg']};
+                    border: 2px solid {c['border']};
+                    border-radius: 8px;
+                    color: {c['text']};
+                    padding: 8px 12px;
+                    selection-background-color: {c['accent']};
+                    selection-color: {c['accent_text']};
+                }}
+                QLineEdit:focus, QTextEdit:focus, QTextBrowser:focus, QComboBox:focus {{
+                    border: 2px solid {c['accent']};
+                }}
+                QLineEdit:hover, QTextEdit:hover, QTextBrowser:hover, QComboBox:hover {{
+                    border: 2px solid {c['accent']};
+                }}
+            """
+            theme_combo.setStyleSheet(input_style)
+            api_url_edit.setStyleSheet(input_style)
+            api_key_edit.setStyleSheet(input_style)
+            model_mid_edit.setStyleSheet(input_style)
+            model_high_edit.setStyleSheet(input_style)
+        
         form.addRow("主题", theme_combo)
         form.addRow("API URL", api_url_edit)
         form.addRow("API Key", api_key_edit)

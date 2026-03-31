@@ -79,14 +79,18 @@ class UserFeaturesMixin:
         self.wordcraft_pending_confirm = False
         self.wordcraft_session_id = None
         self.inner_wordcraft_btn = QPushButton("选词成文")
+        self.inner_wordcraft_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_wordcraft_btn.setCheckable(True)
         self.inner_wordcraft_btn.setIcon(self.build_wordcraft_icon())
         self.inner_wordcraft_btn.clicked.connect(self.on_inner_wordcraft_clicked)
         self.inner_tool_bar_layout.insertWidget(1, self.inner_wordcraft_btn)
         self.inner_tool_settings_btn = QPushButton("设置")
+        self.inner_tool_settings_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_settings_btn.clicked.connect(self.open_wordcraft_settings_dialog)
         self.inner_tool_settings_btn.setVisible(False)
         self.inner_tool_bar_layout.insertWidget(2, self.inner_tool_settings_btn)
+        self.inner_tool_action_1.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.inner_tool_action_2.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_1.clicked.connect(self.create_blank_inner_session)
         self.inner_tool_action_2.clicked.connect(self.delete_current_inner_session)
         self.inner_session_list.itemClicked.connect(self.on_inner_session_activated)
@@ -97,6 +101,7 @@ class UserFeaturesMixin:
         self.inner_dialog_editor._orig_key_press = self.inner_dialog_editor.keyPressEvent
         self.inner_dialog_editor.keyPressEvent = self.on_inner_dialog_key_press
         if hasattr(self, 'inner_confirm_btn'):
+            self.inner_confirm_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.inner_confirm_btn.clicked.connect(self.on_confirm_wordcraft_segments)
             self.inner_confirm_btn.setVisible(False)
         self.load_wordcraft_config()
@@ -235,7 +240,7 @@ class UserFeaturesMixin:
         self.inner_dialog_editor.setHtml(self.markdown_to_html_fragment(text or ""))
 
     def on_inner_dialog_key_press(self, event):
-        if self.inner_active_tool == "wordcraft" and event.key() == Qt.Key.Key_Space:
+        if self.inner_active_tool == "wordcraft" and self.wordcraft_pending_confirm and event.key() == Qt.Key.Key_Space:
             self.wordcraft_special_highlight_on = not self.wordcraft_special_highlight_on
             self.refresh_wordcraft_display()
             return
