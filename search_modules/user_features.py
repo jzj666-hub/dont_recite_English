@@ -202,11 +202,7 @@ class UserFeaturesMixin:
         parts = []
         for token in token_pattern.findall(english):
             if token.isspace():
-                if self.wordcraft_space_highlight_on:
-                    rendered = token.replace(" ", "␠")
-                    parts.append(f"<span style='background:#3d3d3d;color:#ffd166;'>{html.escape(rendered)}</span>")
-                else:
-                    parts.append(html.escape(token))
+                parts.append(html.escape(token))
                 continue
             low = token.lower()
             if self.wordcraft_special_highlight_on and low in special_set:
@@ -216,7 +212,7 @@ class UserFeaturesMixin:
         body = "".join(parts).replace("\n", "<br>")
         return (
             "<div style='line-height:1.7;'>"
-            "<div style='color:#61dafb;margin-bottom:8px;'>提示：按空格键可切换空格高亮；右键可把不懂片段加入讲解列表。</div>"
+            "<div style='color:#61dafb;margin-bottom:8px;'>提示：按空格键可切换特殊词高亮；右键可把不懂片段加入讲解列表。</div>"
             f"<div>{body}</div>"
             "</div>"
         )
@@ -240,7 +236,7 @@ class UserFeaturesMixin:
 
     def on_inner_dialog_key_press(self, event):
         if self.inner_active_tool == "wordcraft" and event.key() == Qt.Key.Key_Space:
-            self.wordcraft_space_highlight_on = not self.wordcraft_space_highlight_on
+            self.wordcraft_special_highlight_on = not self.wordcraft_special_highlight_on
             self.refresh_wordcraft_display()
             return
         handler = getattr(self.inner_dialog_editor, "_orig_key_press", None)
