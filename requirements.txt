@@ -1,2 +1,2 @@
 PyQt6==6.6.1
-argostranslate==1.9.2
+argostranslate

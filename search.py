@@ -5,15 +5,23 @@ import sys
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMainWindow
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ================= 路径自适应魔法开始 =================
+if getattr(sys, 'frozen', False):
+    # 如果是打包后的 exe 运行，获取 exe 所在的真实目录
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # 如果是在开发环境直接运行 py 脚本，获取脚本所在目录
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ================= 路径自适应魔法结束 =================
+
 OFFLINE_ASSETS_DIR = os.path.join(BASE_DIR, "offline_assets")
 PROJECT_ARGOS_PACKAGES_DIR = os.path.join(OFFLINE_ASSETS_DIR, "argos_packages")
 PROJECT_STANZA_RESOURCES_DIR = os.path.join(OFFLINE_ASSETS_DIR, "stanza_resources")
+
 if os.path.isdir(PROJECT_ARGOS_PACKAGES_DIR):
     os.environ["ARGOS_PACKAGES_DIR"] = PROJECT_ARGOS_PACKAGES_DIR
 if os.path.isdir(PROJECT_STANZA_RESOURCES_DIR):
     os.environ["STANZA_RESOURCES_DIR"] = PROJECT_STANZA_RESOURCES_DIR
-
 from search_modules.ai_assistant import AIAssistantMixin
 from search_modules.bootstrap import BootstrapMixin
 from search_modules.infrastructure import InfrastructureMixin, patch_argos_stanza_offline_mode

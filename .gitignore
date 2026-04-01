@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.db
+*.zip
 *.db-journal
 .venv/
 venv/
@@ -11,3 +12,13 @@ ENV/
 .idea/
 .vscode/
 *.log
+*.exe
+*.dll
+*.msi
+*.pdb
+build/
+dist/
+*.spec
+*.toc
+*.pkg
+offline_assets/
