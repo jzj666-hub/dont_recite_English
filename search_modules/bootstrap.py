@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import datetime
 
 from search_modules.infrastructure import LLMCacheStore
 
@@ -24,6 +25,9 @@ class BootstrapMixin:
         self.inner_active_tool = ""
         self.inner_current_session_id = None
         self.wordcraft_config = {}
+        self.study_timer = None
+        self.study_today_label = None
+        self.study_last_tick_dt = datetime.now()
 
     def init_database(self):
         self.conn = sqlite3.connect('stardict.db')
@@ -136,6 +140,27 @@ class BootstrapMixin:
         if 'model_mid' not in self.settings:
             self.set_setting('model_mid', '')
             self.settings['model_mid'] = ''
+        if 'reviewing_sort_basis' not in self.settings:
+            self.set_setting('reviewing_sort_basis', 'recommended')
+            self.settings['reviewing_sort_basis'] = 'recommended'
+        if 'font_english' not in self.settings:
+            self.set_setting('font_english', 'Segoe UI')
+            self.settings['font_english'] = 'Segoe UI'
+        if 'font_chinese' not in self.settings:
+            self.set_setting('font_chinese', 'Microsoft YaHei UI')
+            self.settings['font_chinese'] = 'Microsoft YaHei UI'
+        today = datetime.now().strftime('%Y-%m-%d')
+        if 'study_minutes_date' not in self.settings:
+            self.set_setting('study_minutes_date', today)
+            self.settings['study_minutes_date'] = today
+        if 'study_minutes_today' not in self.settings:
+            self.set_setting('study_minutes_today', '0')
+            self.settings['study_minutes_today'] = '0'
+        if self.settings.get('study_minutes_date') != today:
+            self.set_setting('study_minutes_date', today)
+            self.set_setting('study_minutes_today', '0')
+            self.settings['study_minutes_date'] = today
+            self.settings['study_minutes_today'] = '0'
 
     def set_setting(self, key, value):
         cur = self.user_conn.cursor()

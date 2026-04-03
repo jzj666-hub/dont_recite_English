@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_text
+
 
 class AIChatWindow(QDialog):
     chat_result_ready = pyqtSignal(dict)
@@ -31,8 +33,18 @@ class AIChatWindow(QDialog):
     def __init__(self, app, initial_prompt="", initial_payload="", title="AI 小助手"):
         super().__init__(app)
         self.app = app
+        prompts = {}
+        try:
+            merged = dict(default_ai_prompts())
+            user_obj = loads_prompts(app.settings.get("ai_prompts_json", "") if hasattr(app, "settings") else "")
+            for k, v in (user_obj or {}).items():
+                if isinstance(k, str) and isinstance(v, str) and k.strip():
+                    merged[k.strip()] = v
+            prompts = merged
+        except Exception:
+            prompts = default_ai_prompts()
         self.messages = [
-            {"role": "system", "content": "你是英语学习助手。回答需要准确、清晰、结合上下文。"}
+            {"role": "system", "content": prompt_text(prompts, "chat_system", "你是英语学习助手。回答需要准确、清晰、结合上下文。")}
         ]
         self.setWindowTitle(title)
         self.resize(780, 560)
@@ -193,6 +205,14 @@ class AIChatWindow(QDialog):
 
 
 class AIAssistantMixin:
+    def get_ai_prompts(self):
+        raw = self.settings.get("ai_prompts_json", "") if hasattr(self, "settings") else ""
+        merged = dict(default_ai_prompts())
+        user_obj = loads_prompts(raw)
+        for k, v in (user_obj or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                merged[k.strip()] = v
+        return merged
     def setup_ai_chat_shortcuts(self):
         self.ai_chat_shortcut = QShortcut(QKeySequence('Ctrl+U'), self)
         self.ai_chat_shortcut.activated.connect(self.open_ai_chat_window)
@@ -244,7 +264,7 @@ class AIAssistantMixin:
             f"当前查询：{query}\n"
             f"上下文：\n{context_text}\n\n"
             f"框选内容：{selected_text_for_ai}\n\n"
-            "回答要求：先解释含义，再说明在此语境下的作用，最后给1-2条学习建议。"
+            f"{prompt_text(self.get_ai_prompts(), 'selection_answer_rules', '回答要求：先解释含义，再说明在此语境下的作用，最后给1-2条学习建议。')}"
         )
         self.open_ai_chat_window(initial_prompt=visible_prompt, initial_payload=payload_prompt, title=f"AI 语境提问 - {source_name}")
 
@@ -308,13 +328,8 @@ class AIAssistantMixin:
         if not url or not key or not model:
             self.toggle_favorite_current()
             return
-        prompt = (
-            "你是英语学习助手。请根据给定词条，在候选收藏夹中选择最合适的 1-3 个。"
-            "只输出 JSON，不要输出任何其他文本。"
-            "格式：{\"folders\":[\"收藏夹1\",\"收藏夹2\"]}。\n"
-            f"词条：{self.current_query}\n"
-            f"候选收藏夹：{', '.join(folder_names)}"
-        )
+        tmpl = prompt_text(self.get_ai_prompts(), "smart_favorite_prompt", "")
+        prompt = (tmpl or "").format(query=self.current_query, folders=", ".join(folder_names))
         if self.favorite_option_btn is not None:
             self.favorite_option_btn.setEnabled(False)
         threading.Thread(
@@ -327,7 +342,7 @@ class AIAssistantMixin:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "You are a strict JSON generator."},
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "json_system", "You are a strict JSON generator.")},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
@@ -420,13 +435,8 @@ class AIAssistantMixin:
         if not url or not key or not model:
             QMessageBox.warning(self, "推荐失败", "请先在设置中配置 API URL、API Key 和模型。")
             return
-        prompt = (
-            "你是英语学习助手。请根据给定单词输出最相关的英文关联词。"
-            "只输出 JSON，不要额外文本。"
-            "JSON 格式：{\"words\":[\"word1\",\"word2\",...]}"
-            "要求：6-12 个词，全部英文小写，不能包含原词，不能包含短语。\n"
-            f"原词：{current_word}"
-        )
+        tmpl = prompt_text(self.get_ai_prompts(), "suggest_links_prompt", "")
+        prompt = (tmpl or "").format(word=current_word)
         self.ai_link_suggest_btn.setEnabled(False)
         threading.Thread(target=self._ai_suggest_links_worker, args=(url, key, model, current_word, prompt), daemon=True).start()
 
@@ -434,7 +444,7 @@ class AIAssistantMixin:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "You are a strict JSON generator."},
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "json_system", "You are a strict JSON generator.")},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2,
@@ -506,7 +516,7 @@ class AIAssistantMixin:
         ai_title = QLabel("AI 服务")
         ai_title.setFont(ai_title.font())
         ai_title.setStyleSheet('color: #61dafb; margin-top: 15px; margin-bottom: 5px;')
-        self.detail_layout.addWidget(ai_title)
+        self.detail_ai_layout.addWidget(ai_title)
         self.ai_options_list = QListWidget()
         self.ai_options_list.setFixedHeight(180)
         for t in ["自然解释", "相关短语列举", "固定搭配列举", "词汇变形", "英语语境词语用法", "例句用法", "AI助记", "找近义词", "找反义词"]:
@@ -514,13 +524,13 @@ class AIAssistantMixin:
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             self.ai_options_list.addItem(item)
-        self.detail_layout.addWidget(self.ai_options_list)
+        self.detail_ai_layout.addWidget(self.ai_options_list)
         self.ai_free_input = QLineEdit()
         self.ai_free_input.setPlaceholderText("自由提问（可选）")
-        self.detail_layout.addWidget(self.ai_free_input)
+        self.detail_ai_layout.addWidget(self.ai_free_input)
         self.ai_generate_btn = QPushButton("让 AI 生成")
         self.ai_generate_btn.clicked.connect(self.on_ai_generate_clicked)
-        self.detail_layout.addWidget(self.ai_generate_btn)
+        self.detail_ai_layout.addWidget(self.ai_generate_btn)
         self.apply_styles()
 
     def on_ai_generate_clicked(self):
@@ -642,3 +652,5 @@ class AIAssistantMixin:
     def _finish_ai_generation(self):
         if hasattr(self, 'ai_generate_btn'):
             self.ai_generate_btn.setEnabled(True)
+        if hasattr(self, 'detail_tab_widget'):
+            self.detail_tab_widget.setCurrentIndex(1)

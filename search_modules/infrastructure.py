@@ -21,11 +21,18 @@ def patch_argos_stanza_offline_mode():
     argos_sbd.MiniSBDSentencizer.split_sentences = split_sentences_offline
 
 
-def build_highlighted_text_html(raw_text, query):
+def build_highlighted_text_html(raw_text, query, highlight_bg=None, highlight_text=None):
     text = raw_text if raw_text is not None else ""
     q = (query or "").strip()
     if not q:
         return text, False
+    
+    # 默认使用深色主题的颜色
+    if highlight_bg is None:
+        highlight_bg = '#6b4f00'
+    if highlight_text is None:
+        highlight_text = '#ffe9a8'
+    
     if re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", q):
         pattern = re.compile(rf"(?<![A-Za-z]){re.escape(q)}(?![A-Za-z])", re.IGNORECASE)
     else:
@@ -38,7 +45,7 @@ def build_highlighted_text_html(raw_text, query):
         start, end = m.span()
         if start > last:
             parts.append(html.escape(text[last:start]))
-        parts.append(f"<span style='background-color:#6b4f00;color:#ffe9a8;border-radius:3px;'>{html.escape(text[start:end])}</span>")
+        parts.append(f"<span style='background-color:{highlight_bg};color:{highlight_text};border-radius:3px;'>{html.escape(text[start:end])}</span>")
         last = end
     if not found:
         return text, False

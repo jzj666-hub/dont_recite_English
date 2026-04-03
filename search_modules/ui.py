@@ -1,5 +1,8 @@
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QPalette, QTextCursor
+from datetime import datetime
+import json
+
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -7,7 +10,6 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -19,18 +21,275 @@ from PyQt6.QtWidgets import (
     QTextBrowser,
     QTextEdit,
     QTabWidget,
+    QGraphicsOpacityEffect,
     QVBoxLayout,
     QWidget,
 )
 
 from search_modules.infrastructure import build_highlighted_text_html
+from search_modules.ai_prompts import default_ai_prompts, loads_prompts
 
 
 class UIMixin:
+    def get_ai_prompts(self):
+        raw = self.settings.get("ai_prompts_json", "") if hasattr(self, "settings") else ""
+        merged = dict(default_ai_prompts())
+        user_obj = loads_prompts(raw)
+        for k, v in (user_obj or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                merged[k.strip()] = v
+        return merged
+
+    def update_ui_fonts(self):
+        """
+        字体设置变更后立即刷新界面：
+        - 应用 QApplication 字体
+        - 对当前已存在控件做一次 font 重新应用
+        - 对“详情区”做一次轻量重建（复用当前查询）
+        """
+        self.apply_font_preferences()
+
+        # 递归刷新现有控件字体 + 非标题字号整体放大 1.4 倍
+        try:
+            base = self.make_ui_font(10, False)
+            self.setFont(base)
+            for w in self.findChildren(QWidget):
+                f = w.font()
+                fams = base.families()
+                if fams:
+                    f.setFamilies(fams)
+                # 标题字号不动：粗体且字号>=16 视为标题
+                try:
+                    is_title = bool(f.bold()) and float(f.pointSizeF()) >= 16.0
+                except Exception:
+                    is_title = False
+                if not is_title:
+                    try:
+                        if float(f.pointSizeF()) > 0:
+                            f.setPointSizeF(float(f.pointSizeF()) * 1.4)
+                    except Exception:
+                        pass
+                w.setFont(f)
+
+            # 最右侧会话框再额外放大到 1.8 倍（在 1.4 倍基础上）
+            if hasattr(self, "inner_dialog_editor") and self.inner_dialog_editor is not None:
+                try:
+                    f2 = self.inner_dialog_editor.font()
+                    f2.setPointSizeF(max(1.0, float(f2.pointSizeF()) * (1.8 / 1.4)))
+                    self.inner_dialog_editor.setFont(f2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 详情区内容需要重建，才能让那些创建时写死的字体被替换为当前偏好
+        try:
+            if hasattr(self, "current_page_kind") and hasattr(self, "current_query") and self.current_query:
+                kind = self.current_page_kind
+                q = self.current_query
+                if kind == "word" and hasattr(self, "show_word_detail"):
+                    self.animate_detail_change(lambda: (self.clear_detail(), self.show_word_detail(q, skip_clear=True)))
+                elif kind == "sentence" and hasattr(self, "translate_text"):
+                    self.animate_detail_change(lambda: (self.clear_detail(), self.translate_text(q, skip_clear=True)))
+        except Exception:
+            pass
+
+    def animate_detail_change(self, build_func):
+        """
+        让详情区在切换内容时先淡出，再构建新内容并淡入。
+        build_func: 一个无参函数，用于构建详情区新内容（内部通常会 clear_detail 并重新 addWidget）。
+        """
+        if not hasattr(self, "detail_widget") or self.detail_widget is None:
+            build_func()
+            return
+
+        # 停掉可能存在的旧动画，避免连点导致状态错乱
+        prev = getattr(self, "_detail_fade_anim", None)
+        if prev is not None:
+            try:
+                prev.stop()
+            except Exception:
+                pass
+        self._detail_fade_anim = None
+
+        # 以 QScrollArea 的 viewport 作为淡入淡出目标，可覆盖滚动区域整体（避免某些子控件不吃 effect）
+        w = None
+        if hasattr(self, "detail_area") and self.detail_area is not None:
+            try:
+                w = self.detail_area.viewport()
+            except Exception:
+                w = None
+        if w is None:
+            w = self.detail_widget
+        old_effect = w.graphicsEffect()
+        effect = old_effect if isinstance(old_effect, QGraphicsOpacityEffect) else QGraphicsOpacityEffect(w)
+        w.setGraphicsEffect(effect)
+        effect.setOpacity(1.0)
+
+        fade_out = QPropertyAnimation(effect, b"opacity", self)
+        # 更快淡出：点击后内容迅速“消失”，避免最后一刻突然清空的突兀感
+        fade_out.setDuration(90)
+        fade_out.setStartValue(float(effect.opacity()))
+        fade_out.setEndValue(0.0)
+        fade_out.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def after_out():
+            try:
+                build_func()
+            except Exception:
+                # 即使构建失败，也不要让界面永远透明
+                pass
+            # 构建后可能 detail_widget 仍是同一个，重新取一次
+            w2 = getattr(self, "detail_widget", None)
+            if w2 is None:
+                return
+            # 淡入同样作用于 viewport（若存在）
+            w_in = None
+            if hasattr(self, "detail_area") and self.detail_area is not None:
+                try:
+                    w_in = self.detail_area.viewport()
+                except Exception:
+                    w_in = None
+            if w_in is None:
+                w_in = w2
+
+            eff2 = w_in.graphicsEffect()
+            if not isinstance(eff2, QGraphicsOpacityEffect):
+                eff2 = QGraphicsOpacityEffect(w_in)
+                w_in.setGraphicsEffect(eff2)
+            eff2.setOpacity(0.0)
+            fade_in = QPropertyAnimation(eff2, b"opacity", self)
+            fade_in.setDuration(180)
+            fade_in.setStartValue(0.0)
+            fade_in.setEndValue(1.0)
+            fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+            def clear_effect():
+                # 清理 effect：优先清理 viewport，其次 detail_widget
+                if hasattr(self, "detail_area") and self.detail_area is not None:
+                    try:
+                        vp = self.detail_area.viewport()
+                        if vp is not None and isinstance(vp.graphicsEffect(), QGraphicsOpacityEffect):
+                            vp.setGraphicsEffect(None)
+                    except Exception:
+                        pass
+                ww = getattr(self, "detail_widget", None)
+                if ww is not None and isinstance(ww.graphicsEffect(), QGraphicsOpacityEffect):
+                    ww.setGraphicsEffect(None)
+                self._detail_fade_anim = None
+
+            fade_in.finished.connect(clear_effect)
+            self._detail_fade_anim = fade_in
+            fade_in.start()
+
+        fade_out.finished.connect(after_out)
+        self._detail_fade_anim = fade_out
+        fade_out.start()
+
+    def build_font_choices(self):
+        """
+        返回字体选项列表：[(label, family, note), ...]
+        label 用于下拉显示；family 用于实际保存；note 用于 tooltip/说明。
+        """
+        available = set(QFontDatabase.families())
+
+        def pick(family, note):
+            if family in available:
+                label = f"{family}（{note}）" if note else family
+                return (label, family, note)
+            return None
+
+        # 先放常用/推荐，再补全系统字体
+        preferred = [
+            ("Segoe UI", "默认英文字体，清晰耐看"),
+            ("Calibri", "圆润现代，屏幕阅读友好"),
+            ("Arial", "通用无衬线，兼容性强"),
+            ("Consolas", "等宽字体，适合音标/代码/对齐"),
+            ("Times New Roman", "衬线字体，偏传统排版风格"),
+            ("Microsoft YaHei UI", "常见中文 UI 字体"),
+            ("微软雅黑", "常见中文字体（部分系统显示为“Microsoft YaHei”）"),
+            ("SimSun", "宋体，传统印刷风格"),
+            ("SimHei", "黑体，标题感更强"),
+            ("Noto Sans CJK SC", "谷歌 Noto 中文无衬线（若已安装）"),
+            ("Source Han Sans SC", "思源黑体（若已安装）"),
+        ]
+
+        out = []
+        seen = set()
+        for fam, note in preferred:
+            item = pick(fam, note)
+            if item and item[1] not in seen:
+                out.append(item)
+                seen.add(item[1])
+
+        # 追加剩余字体（不带注释）
+        for fam in sorted(available, key=lambda s: s.lower()):
+            if fam in seen:
+                continue
+            out.append((fam, fam, ""))
+        return out
+
+    def get_font_preferences(self):
+        english = (self.settings.get('font_english', 'Segoe UI') or 'Segoe UI').strip()
+        chinese = (self.settings.get('font_chinese', 'Microsoft YaHei UI') or 'Microsoft YaHei UI').strip()
+        return english, chinese
+
+    def make_ui_font(self, size=10, bold=False):
+        english, chinese = self.get_font_preferences()
+        font = QFont()
+        font.setFamilies([english, chinese])
+        # 全局非标题字号放大：小字号（<16）统一按 1.4 倍缩放；标题字号保持不变
+        scale = 1.4
+        target_size = float(size)
+        if target_size < 16:
+            target_size = target_size * scale
+        font.setPointSizeF(target_size)
+        font.setBold(bool(bold))
+        return font
+
+    def apply_font_preferences(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+        base = self.make_ui_font(10, False)
+        app.setFont(base)
+
+    def init_study_timer(self):
+        if not hasattr(self, 'study_today_label'):
+            return
+        self.study_last_tick_dt = datetime.now()
+        self.study_timer = QTimer(self)
+        self.study_timer.timeout.connect(self.on_study_timer_tick)
+        self.study_timer.start(60000)
+        self.on_study_timer_tick()
+
+    def get_study_minutes_today(self):
+        try:
+            return max(0, int(self.settings.get('study_minutes_today', '0') or 0))
+        except Exception:
+            return 0
+
+    def on_study_timer_tick(self):
+        now = datetime.now()
+        delta_min = int((now - self.study_last_tick_dt).total_seconds() // 60)
+        if delta_min > 0:
+            total = self.get_study_minutes_today() + delta_min
+            self.set_setting('study_minutes_today', str(total))
+            self.settings['study_minutes_today'] = str(total)
+            self.study_last_tick_dt = now
+        self.update_study_today_label()
+
+    def update_study_today_label(self):
+        if not hasattr(self, 'study_today_label') or self.study_today_label is None:
+            return
+        mins = self.get_study_minutes_today()
+        self.study_today_label.setText(f"🐣 今天已经学了 {mins} 分钟啦～")
+
     def init_ui(self):
         self.setWindowTitle('英语查词翻译软件')
         self.setGeometry(100, 100, 900, 700)
         self.apply_theme()
+        self.apply_font_preferences()
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout()
@@ -65,10 +324,15 @@ class UIMixin:
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_widget.setLayout(header_layout)
         title_label = QLabel('🔍 英语查词翻译')
-        title_label.setFont(QFont('Segoe UI', 24, QFont.Weight.Bold))
+        title_label.setFont(self.make_ui_font(24, True))
         title_label.setStyleSheet('color: #61dafb;')
         title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         header_layout.addWidget(title_label)
+        self.study_today_label = QLabel("")
+        self.study_today_label.setFont(self.make_ui_font(11, False))
+        self.study_today_label.setStyleSheet('color: #ffb86b; margin-left: 12px;')
+        self.study_today_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        header_layout.addWidget(self.study_today_label)
         header_layout.addStretch()
         self.settings_btn = QPushButton('设置')
         self.settings_btn.setFixedHeight(32)
@@ -77,13 +341,13 @@ class UIMixin:
         left_layout.addWidget(header_widget)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText('输入单词或句子...')
-        self.search_input.setFont(QFont('Segoe UI', 14))
+        self.search_input.setFont(self.make_ui_font(14, False))
         self.search_input.textChanged.connect(self.on_search_text_changed)
         self.search_input.returnPressed.connect(self.on_enter_pressed)
         left_layout.addWidget(self.search_input)
         self.search_input.keyPressEvent = self.on_search_key_press
         self.candidates_list = QListWidget()
-        self.candidates_list.setFont(QFont('Consolas', 12))
+        self.candidates_list.setFont(self.make_ui_font(12, False))
         self.candidates_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.candidates_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.candidates_list.keyPressEvent = self.on_candidates_key_press
@@ -103,9 +367,37 @@ class UIMixin:
         self.detail_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.detail_widget.setLayout(self.detail_layout)
         self.detail_area.setWidget(self.detail_widget)
-        left_layout.addWidget(self.detail_area)
+
+        self.detail_tab_widget = QTabWidget()
+        self.detail_tab_widget.setDocumentMode(True)
+
+        self.detail_info_tab = QScrollArea()
+        self.detail_info_tab.setWidgetResizable(True)
+        self.detail_info_widget = QWidget()
+        self.detail_info_layout = QVBoxLayout()
+        self.detail_info_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.detail_info_widget.setLayout(self.detail_info_layout)
+        self.detail_info_tab.setWidget(self.detail_info_widget)
+
+        self.detail_note_tab = QWidget()
+        self.detail_note_layout = QVBoxLayout()
+        self.detail_note_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.detail_note_layout.setContentsMargins(0, 0, 0, 0)
+        self.detail_note_tab.setLayout(self.detail_note_layout)
+
+        self.detail_ai_tab = QWidget()
+        self.detail_ai_layout = QVBoxLayout()
+        self.detail_ai_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.detail_ai_layout.setContentsMargins(0, 0, 0, 0)
+        self.detail_ai_tab.setLayout(self.detail_ai_layout)
+
+        self.detail_tab_widget.addTab(self.detail_info_tab, "基础信息")
+        self.detail_tab_widget.addTab(self.detail_note_tab, "批注")
+        self.detail_tab_widget.addTab(self.detail_ai_tab, "AI 服务")
+
+        left_layout.addWidget(self.detail_tab_widget)
         fav_title = QLabel('⭐ 收藏夹')
-        fav_title.setFont(QFont('Segoe UI', 16, QFont.Weight.Bold))
+        fav_title.setFont(self.make_ui_font(16, True))
         fav_title.setStyleSheet('color: #ffc107;')
         fav_title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         right_layout.addWidget(fav_title)
@@ -126,7 +418,7 @@ class UIMixin:
         self.folders_list.itemClicked.connect(self.on_folder_changed)
         right_layout.addWidget(self.folders_list)
         self.favorites_list = QListWidget()
-        self.favorites_list.setFont(QFont('Consolas', 12))
+        self.favorites_list.setFont(self.make_ui_font(12, False))
         self.favorites_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.favorites_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.favorites_list.itemActivated.connect(self.on_favorite_activated)
@@ -160,6 +452,15 @@ class UIMixin:
         review_title = QLabel("🔥 在背状态单词")
         review_title.setFont(QFont('Segoe UI', 14, QFont.Weight.Bold))
         inner_left_layout.addWidget(review_title)
+        review_sort_row = QWidget()
+        review_sort_layout = QHBoxLayout()
+        review_sort_layout.setContentsMargins(0, 0, 0, 0)
+        review_sort_row.setLayout(review_sort_layout)
+        review_sort_label = QLabel("排序依据")
+        review_sort_layout.addWidget(review_sort_label)
+        self.reviewing_sort_combo = QComboBox()
+        review_sort_layout.addWidget(self.reviewing_sort_combo, 1)
+        inner_left_layout.addWidget(review_sort_row)
         self.reviewing_words_list = QListWidget()
         self.reviewing_words_list.itemActivated.connect(self.on_favorite_activated)
         self.reviewing_words_list.itemClicked.connect(self.on_favorite_activated)
@@ -188,25 +489,76 @@ class UIMixin:
         self.inner_dialog_area_layout.setSpacing(10)
         self.inner_dialog_area.setLayout(self.inner_dialog_area_layout)
         self.inner_session_list = QListWidget()
-        self.inner_session_list.setMinimumWidth(160)
+        self.inner_session_list.setMinimumWidth(120)
+        self.inner_session_list.setMaximumWidth(200)
         self.inner_dialog_area_layout.addWidget(self.inner_session_list, 1)
+        # 右侧会话区：支持在"普通会话文本"和"随机考词面板"之间切换
+        self.inner_dialog_host = QWidget()
+        self.inner_dialog_stack = QStackedLayout()
+        self.inner_dialog_stack.setContentsMargins(0, 0, 0, 0)
+        self.inner_dialog_host.setLayout(self.inner_dialog_stack)
         self.inner_dialog_editor = QTextEdit()
         self.inner_dialog_editor.setPlaceholderText("用于 AI 对话或其他特殊用途（待定）")
-        self.inner_dialog_area_layout.addWidget(self.inner_dialog_editor, 1)
+        # 放大最右侧"会话框"文本（不是会话历史列表）到原来的 1.8 倍
+        try:
+            f = self.inner_dialog_editor.font()
+            f.setPointSizeF(max(1.0, float(f.pointSizeF()) * 1.8))
+            self.inner_dialog_editor.setFont(f)
+        except Exception:
+            pass
+        self.inner_quiz_panel = QWidget()
+        self.inner_dialog_stack.addWidget(self.inner_dialog_editor)
+        self.inner_dialog_stack.addWidget(self.inner_quiz_panel)
+        self.inner_dialog_stack.setCurrentWidget(self.inner_dialog_editor)
+        self.inner_dialog_area_layout.addWidget(self.inner_dialog_host, 4)
         inner_right_layout.addWidget(self.inner_dialog_area, 1)
         self.inner_confirm_btn = QPushButton("确认已选中不懂片段")
         self.inner_confirm_btn.setVisible(False)
         inner_right_layout.addWidget(self.inner_confirm_btn)
         if hasattr(self, 'init_inner_workspace'):
             self.init_inner_workspace()
+        if hasattr(self, 'init_reviewing_sort_ui'):
+            self.init_reviewing_sort_ui()
         self.load_folders()
         self.load_favorites_list()
         self.refresh_internal_page()
         self.apply_styles()
         if hasattr(self, 'setup_ai_chat_shortcuts'):
             self.setup_ai_chat_shortcuts()
+        self.init_study_timer()
 
     def on_main_tab_changed(self, index):
+        if hasattr(self, 'main_tabs'):
+            prev_anim = getattr(self, '_tab_fade_anim', None)
+            if prev_anim is not None:
+                prev_anim.stop()
+            prev_page = getattr(self, '_tab_fade_page', None)
+            prev_effect = getattr(self, '_tab_fade_effect', None)
+            if prev_page is not None and prev_effect is not None and prev_page.graphicsEffect() is prev_effect:
+                prev_page.setGraphicsEffect(None)
+            page = self.main_tabs.widget(index)
+            if page is not None:
+                effect = QGraphicsOpacityEffect(page)
+                page.setGraphicsEffect(effect)
+                effect.setOpacity(0.0)
+                anim = QPropertyAnimation(effect, b"opacity", self)
+                anim.setDuration(260)
+                anim.setStartValue(0.0)
+                anim.setEndValue(1.0)
+                anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+                self._tab_fade_page = page
+                self._tab_fade_effect = effect
+                self._tab_fade_anim = anim
+
+                def clear_effect():
+                    if page.graphicsEffect() is effect:
+                        page.setGraphicsEffect(None)
+                    self._tab_fade_page = None
+                    self._tab_fade_effect = None
+                    self._tab_fade_anim = None
+
+                anim.finished.connect(clear_effect)
+                anim.start()
         if index == 1:
             self.refresh_internal_page()
 
@@ -263,6 +615,9 @@ class UIMixin:
                 'accent': '#1a73e8',
                 'accent_text': '#ffffff',
                 'widget_bg': '#ffffff',
+                'accent_hover': '#0d47a1',
+                'highlight_bg': '#e1bee7',  # 浅色主题紫色高亮背景
+                'highlight_text': '#4a148c',  # 浅色主题紫色高亮文字
             }
         return {
             'bg': '#1e1e1e',
@@ -273,6 +628,9 @@ class UIMixin:
             'accent': '#61dafb',
             'accent_text': '#000000',
             'widget_bg': '#1e1e1e',
+            'accent_hover': '#21a1c4',
+            'highlight_bg': '#6b4f00',  # 深色主题金色高亮背景
+            'highlight_text': '#ffe9a8',  # 深色主题金色高亮文字
         }
 
     def apply_styles(self):
@@ -344,24 +702,86 @@ class UIMixin:
             self.reviewing_words_list.setStyleSheet(
                 f"QListWidget{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:5px;}}QListWidget::item{{padding:8px;border-bottom:1px solid {c['bg_alt']};}}QListWidget::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
             )
+        if hasattr(self, 'reviewing_sort_combo'):
+            self.reviewing_sort_combo.setStyleSheet(input_style)
         if hasattr(self, 'inner_session_list'):
             self.inner_session_list.setStyleSheet(
                 f"QListWidget{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:5px;}}QListWidget::item{{padding:8px;border-bottom:1px solid {c['bg_alt']};}}QListWidget::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
             )
         if hasattr(self, 'inner_dialog_editor'):
             self.inner_dialog_editor.setStyleSheet(input_style)
+        if hasattr(self, 'ai_free_input'):
+            self.ai_free_input.setStyleSheet(input_style)
         if hasattr(self, 'inner_tool_title'):
             self.inner_tool_title.setStyleSheet(f"color:{c['accent']};font-weight:600;")
+
+        # 右键菜单在深色主题下保持可读
+        menu_style = (
+            f"QMenu{{background-color:{c['widget_bg']};color:{c['text']};border:1px solid {c['border']};}}"
+            f"QMenu::item{{padding:6px 22px;}}"
+            f"QMenu::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
+            f"QMenu::separator{{height:1px;background:{c['border']};margin:4px 8px;}}"
+        )
+        # 避免反复 apply_styles 导致样式无限追加
+        existing = self.styleSheet() or ""
+        if "QMenu{" in existing:
+            # 简单替换：若已存在菜单样式则不重复追加
+            pass
+        else:
+            self.setStyleSheet(existing + "\n" + menu_style)
+
+        self.apply_font_preferences()
+        self.update_study_today_label()
 
     def open_settings_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("设置")
+        dlg.setMinimumSize(700, 600)
+        dlg.resize(800, 700)
         
         # 应用当前主题到对话框
         if hasattr(self, 'colors'):
             c = self.colors
-            dlg.setStyleSheet(f"QDialog {{ background-color: {c['bg']}; color: {c['text']}; }}")
+            dlg.setStyleSheet(f"""
+                QDialog {{ 
+                    background-color: {c['bg']}; 
+                    color: {c['text']}; 
+                }}
+                QScrollArea {{
+                    border: none;
+                    background-color: transparent;
+                }}
+                QScrollBar:vertical {{
+                    background-color: {c['widget_bg']};
+                    width: 12px;
+                    border-radius: 6px;
+                    margin: 0px;
+                }}
+                QScrollBar::handle:vertical {{
+                    background-color: {c['accent']};
+                    border-radius: 6px;
+                    min-height: 30px;
+                }}
+                QScrollBar::handle:vertical:hover {{
+                    background-color: {c['accent_hover']};
+                }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                    border: none;
+                    background: none;
+                }}
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                    background: none;
+                }}
+            """)
         
+        # 创建滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        # 创建内容容器
+        content_widget = QWidget()
         form = QFormLayout()
         theme_combo = QComboBox()
         theme_combo.addItems(["深色", "浅色"])
@@ -375,6 +795,162 @@ class UIMixin:
         model_mid_edit.setText(self.get_mid_model_name())
         model_high_edit = QLineEdit()
         model_high_edit.setText(self.get_high_model_name())
+        font_english_edit = QComboBox()
+        font_chinese_edit = QComboBox()
+        font_english_edit.setEditable(True)
+        font_chinese_edit.setEditable(True)
+        eng, zh = self.get_font_preferences()
+
+        # 字体选项：带“特色说明”，并允许手动输入自定义字体
+        font_choices = self.build_font_choices() if hasattr(self, "build_font_choices") else []
+        for label, family, note in font_choices:
+            font_english_edit.addItem(label, family)
+            font_chinese_edit.addItem(label, family)
+            if note:
+                idx_e = font_english_edit.count() - 1
+                idx_c = font_chinese_edit.count() - 1
+                font_english_edit.setItemData(idx_e, note, Qt.ItemDataRole.ToolTipRole)
+                font_chinese_edit.setItemData(idx_c, note, Qt.ItemDataRole.ToolTipRole)
+
+        def set_combo_to_family(combo, family):
+            target = (family or "").strip()
+            if not target:
+                return
+            for i in range(combo.count()):
+                if (combo.itemData(i) or "").strip().lower() == target.lower():
+                    combo.setCurrentIndex(i)
+                    return
+            combo.setEditText(target)
+
+        set_combo_to_family(font_english_edit, eng)
+        set_combo_to_family(font_chinese_edit, zh)
+        
+        # AI 提示词设置 - 分类标签页
+        ai_prompts_tabs = QTabWidget()
+        ai_prompts_tabs.setDocumentMode(True)
+        
+        # 获取当前提示词设置
+        try:
+            current_prompts = loads_prompts(self.settings.get("ai_prompts_json", "")) if hasattr(self, "settings") else {}
+            if not current_prompts:
+                current_prompts = default_ai_prompts()
+        except Exception:
+            current_prompts = default_ai_prompts()
+        
+        # 分类定义
+        categories = {
+            "通用设置": ["chat_system", "json_system", "translator_system", "note_ai_system"],
+            "词条页AI服务": ["detail_ai_header", "detail_ai_tail"],
+            "右键语境提问": ["selection_answer_rules"],
+            "AI收藏夹推荐": ["smart_favorite_prompt"],
+            "AI关联词推荐": ["suggest_links_prompt"],
+            "LLM补充翻译": ["llm_translate_prompt"],
+            "随机考词": ["quiz_hint_prompt", "quiz_grade_prompt"]
+        }
+        
+        # 创建每个分类的标签页
+        all_prompt_edits = {}
+        for category_name, prompt_keys in categories.items():
+            tab_widget = QWidget()
+            tab_layout = QVBoxLayout()
+            tab_layout.setSpacing(10)
+            tab_widget.setLayout(tab_layout)
+            
+            # 添加分类说明
+            category_desc = QLabel(self._get_category_description(category_name))
+            category_desc.setWordWrap(True)
+            category_desc.setStyleSheet("color: #888; font-size: 12px; margin-bottom: 10px;")
+            tab_layout.addWidget(category_desc)
+            
+            # 添加每个提示词的编辑框
+            for key in prompt_keys:
+                prompt_data = current_prompts.get(key, {})
+                if isinstance(prompt_data, str):
+                    prompt_text = prompt_data
+                    agent_info = "未知"
+                    purpose_info = "未知"
+                else:
+                    prompt_text = prompt_data.get("text", "")
+                    agent_info = prompt_data.get("agent", "未知")
+                    purpose_info = prompt_data.get("purpose", "未知")
+                
+                # 提示词标题和说明
+                prompt_header = QLabel(f"<b>{key}</b>")
+                prompt_header.setStyleSheet("color: #61dafb; font-size: 14px; margin-top: 10px;")
+                tab_layout.addWidget(prompt_header)
+                
+                prompt_desc = QLabel(f"用途：{purpose_info} | 使用位置：{agent_info}")
+                prompt_desc.setStyleSheet("color: #aaa; font-size: 11px; margin-bottom: 5px;")
+                tab_layout.addWidget(prompt_desc)
+                
+                # 提示词编辑框
+                prompt_edit = QTextEdit()
+                prompt_edit.setMinimumHeight(80)
+                prompt_edit.setMaximumHeight(150)
+                prompt_edit.setPlainText(prompt_text)
+                prompt_edit.setPlaceholderText(f"请输入 {key} 的提示词内容")
+                all_prompt_edits[key] = prompt_edit
+                tab_layout.addWidget(prompt_edit)
+            
+            tab_layout.addStretch()
+            ai_prompts_tabs.addTab(tab_widget, category_name)
+        
+        # 高级选项：原始JSON编辑
+        advanced_tab = QWidget()
+        advanced_layout = QVBoxLayout()
+        advanced_tab.setLayout(advanced_layout)
+        
+        advanced_desc = QLabel("<b>高级选项：直接编辑JSON</b><br/>仅建议熟悉JSON格式的用户使用此功能。")
+        advanced_desc.setWordWrap(True)
+        advanced_layout.addWidget(advanced_desc)
+        
+        ai_prompts_json_edit = QTextEdit()
+        ai_prompts_json_edit.setMinimumHeight(200)
+        ai_prompts_json_edit.setPlainText(json.dumps(current_prompts, ensure_ascii=False, indent=2))
+        ai_prompts_json_edit.setPlaceholderText("AI 提示词 JSON（高级选项）")
+        advanced_layout.addWidget(ai_prompts_json_edit)
+        
+        prompts_btn_row = QWidget()
+        prompts_btn_layout = QHBoxLayout()
+        prompts_btn_layout.setContentsMargins(0, 0, 0, 0)
+        prompts_btn_row.setLayout(prompts_btn_layout)
+        
+        prompts_restore_btn = QPushButton("恢复默认 AI 提示词")
+        prompts_apply_json_btn = QPushButton("应用JSON到分类编辑")
+        prompts_btn_layout.addWidget(prompts_restore_btn)
+        prompts_btn_layout.addWidget(prompts_apply_json_btn)
+        prompts_btn_layout.addStretch()
+        advanced_layout.addWidget(prompts_btn_row)
+        
+        ai_prompts_tabs.addTab(advanced_tab, "高级编辑")
+        
+        def restore_prompts():
+            default_prompts = default_ai_prompts()
+            ai_prompts_json_edit.setPlainText(json.dumps(default_prompts, ensure_ascii=False, indent=2))
+            # 同时更新分类编辑框
+            for key, edit in all_prompt_edits.items():
+                prompt_data = default_prompts.get(key, {})
+                if isinstance(prompt_data, str):
+                    edit.setPlainText(prompt_data)
+                else:
+                    edit.setPlainText(prompt_data.get("text", ""))
+        
+        def apply_json_to_edits():
+            try:
+                json_text = ai_prompts_json_edit.toPlainText().strip()
+                if json_text:
+                    parsed = json.loads(json_text)
+                    for key, edit in all_prompt_edits.items():
+                        prompt_data = parsed.get(key, {})
+                        if isinstance(prompt_data, str):
+                            edit.setPlainText(prompt_data)
+                        else:
+                            edit.setPlainText(prompt_data.get("text", ""))
+            except Exception as e:
+                QMessageBox.warning(dlg, "JSON解析错误", f"无法解析JSON：{str(e)}")
+        
+        prompts_restore_btn.clicked.connect(restore_prompts)
+        prompts_apply_json_btn.clicked.connect(apply_json_to_edits)
         
         # 应用统一的输入框样式
         if hasattr(self, 'colors'):
@@ -401,17 +977,40 @@ class UIMixin:
             api_key_edit.setStyleSheet(input_style)
             model_mid_edit.setStyleSheet(input_style)
             model_high_edit.setStyleSheet(input_style)
+            font_english_edit.setStyleSheet(input_style)
+            font_chinese_edit.setStyleSheet(input_style)
+            ai_prompts_json_edit.setStyleSheet(input_style)
+            # 为所有分类编辑框应用样式
+            for edit in all_prompt_edits.values():
+                edit.setStyleSheet(input_style)
         
+        # 设置表单布局
         form.addRow("主题", theme_combo)
         form.addRow("API URL", api_url_edit)
         form.addRow("API Key", api_key_edit)
         form.addRow("中级模型名", model_mid_edit)
         form.addRow("高级模型名", model_high_edit)
+        form.addRow("英文字体", font_english_edit)
+        form.addRow("中文字体", font_chinese_edit)
+        form.addRow("AI 提示词", ai_prompts_tabs)
+        
+        # 设置内容容器的布局
+        content_layout = QVBoxLayout()
+        content_layout.addLayout(form)
+        content_layout.addStretch()
+        content_widget.setLayout(content_layout)
+        
+        # 将内容容器放入滚动区域
+        scroll_area.setWidget(content_widget)
+        
+        # 创建按钮区域
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        container = QVBoxLayout()
-        container.addLayout(form)
-        container.addWidget(buttons)
-        dlg.setLayout(container)
+        
+        # 主布局：滚动区域 + 按钮
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(scroll_area, 1)  # 滚动区域占据主要空间
+        main_layout.addWidget(buttons)
+        dlg.setLayout(main_layout)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         if dlg.exec():
@@ -423,15 +1022,51 @@ class UIMixin:
             high_model = model_high_edit.text().strip()
             self.set_setting('model_high', high_model)
             self.set_setting('model', high_model)
+            eng_val = (font_english_edit.currentData() or font_english_edit.currentText() or "").strip()
+            zh_val = (font_chinese_edit.currentData() or font_chinese_edit.currentText() or "").strip()
+            self.set_setting('font_english', eng_val or 'Segoe UI')
+            self.set_setting('font_chinese', zh_val or 'Microsoft YaHei UI')
+            
+            # 处理AI提示词设置（从分类编辑框构建JSON）
+            merged_prompts = {}
+            default_prompts = default_ai_prompts()
+            
+            # 从分类编辑框收集所有提示词
+            for key, edit in all_prompt_edits.items():
+                prompt_text = edit.toPlainText().strip()
+                if prompt_text:
+                    # 保持原有的结构（如果有agent和purpose信息）
+                    default_data = default_prompts.get(key, {})
+                    if isinstance(default_data, dict) and 'agent' in default_data:
+                        merged_prompts[key] = {
+                            "agent": default_data.get("agent", ""),
+                            "purpose": default_data.get("purpose", ""),
+                            "text": prompt_text
+                        }
+                    else:
+                        merged_prompts[key] = prompt_text
+            
+            # 保存到设置
+            if merged_prompts:
+                self.set_setting("ai_prompts_json", json.dumps(merged_prompts, ensure_ascii=False, indent=2))
+            else:
+                # 如果没有修改，保持原设置
+                pass
             self.load_settings()
             self.apply_theme()
             self.apply_styles()
+            # 立刻刷新当前界面字体（含那些创建时写死字体的控件，需要重绘/重建内容区）
+            if hasattr(self, "update_ui_fonts") and callable(getattr(self, "update_ui_fonts")):
+                self.update_ui_fonts()
 
     def build_note_section(self):
         note_title = QLabel("批注")
         note_title.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
         note_title.setStyleSheet('color: #61dafb; margin-top: 15px; margin-bottom: 5px;')
-        self.detail_layout.addWidget(note_title)
+        self.detail_note_layout.addWidget(note_title)
+        save_note_btn = QPushButton("保存批注")
+        save_note_btn.clicked.connect(self.save_current_note)
+        self.detail_note_layout.addWidget(save_note_btn)
         self.note_host = QWidget()
         self.note_host.setMinimumHeight(220)
         self.note_stack = QStackedLayout()
@@ -451,7 +1086,7 @@ class UIMixin:
             self.install_ai_selection_context_menu(self.note_preview, "批注栏预览")
         self.note_stack.addWidget(self.note_preview)
         self.note_stack.addWidget(self.note_edit)
-        self.detail_layout.addWidget(self.note_host)
+        self.detail_note_layout.addWidget(self.note_host)
         self.note_edit.focusOutEvent = self.on_note_edit_focus_out
         self.note_preview_cache_key = None
         self.update_note_preview()
@@ -476,6 +1111,19 @@ class UIMixin:
             self.note_stack.setCurrentWidget(self.note_preview)
             self.note_preview.verticalScrollBar().setValue(self.note_edit.verticalScrollBar().value())
 
+    def _get_category_description(self, category_name):
+        """获取分类的详细说明"""
+        descriptions = {
+            "通用设置": "这些是基础的系统提示词，影响AI在所有功能中的基本行为。包括聊天角色定义、JSON输出要求、翻译风格等。",
+            "词条页AI服务": "控制词条详情页中AI服务的提示词，包括AI批注生成、词条解释等功能的开头和结尾约束。",
+            "右键语境提问": "当您在文本中右键选择文字并提问时使用的提示词，控制AI对选中文本的回答风格和内容要求。",
+            "AI收藏夹推荐": "当使用AI智能推荐收藏夹功能时使用的提示词，控制AI如何根据当前词条选择合适的收藏夹。",
+            "AI关联词推荐": "AI推荐相关单词功能使用的提示词，控制AI如何选择和推荐与当前单词相关的词汇。",
+            "LLM补充翻译": "LLM翻译功能使用的提示词，控制AI如何生成详细的单词释义、例句和常见用法。",
+            "随机考词": "随机考词功能中使用的提示词，包括单词提示（轻/中/强提示）和最终评档的规则设置。"
+        }
+        return descriptions.get(category_name, "该分类的详细说明。")
+
     def switch_note_to_edit(self):
         if hasattr(self, 'note_stack'):
             self.note_stack.setCurrentWidget(self.note_edit)
@@ -491,16 +1139,41 @@ class UIMixin:
                 return
             self.note_preview_cache_key = cache_key
             if in_review and self.current_query:
-                highlighted_html, matched = build_highlighted_text_html(text, self.current_query)
+                # 获取当前主题的高亮颜色
+                highlight_bg = self.colors.get('highlight_bg', '#6b4f00')
+                highlight_text = self.colors.get('highlight_text', '#ffe9a8')
+                highlighted_html, matched = build_highlighted_text_html(text, self.current_query, highlight_bg, highlight_text)
                 if matched:
                     self.note_preview.setHtml(f"<div style='white-space: pre-wrap;'>{highlighted_html}</div>")
                     return
             self.note_preview.setMarkdown(text)
 
     def create_folder(self):
-        name, ok = QInputDialog.getText(self, '新建收藏文件夹', '文件夹名称')
-        folder_name = name.strip()
-        if not ok or not folder_name:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("新建收藏文件夹")
+        root = QVBoxLayout()
+        form = QFormLayout()
+        name_edit = QLineEdit()
+        form.addRow("文件夹名称", name_edit)
+        root.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        root.addWidget(buttons)
+        dlg.setLayout(root)
+        if hasattr(self, 'colors'):
+            c = self.colors
+            dlg.setStyleSheet(f"QDialog {{ background-color: {c['bg']}; color: {c['text']}; }}")
+            input_style = (
+                f"QLineEdit{{background-color:{c['widget_bg']};border:2px solid {c['border']};"
+                f"border-radius:8px;color:{c['text']};padding:8px 12px;}}"
+                f"QLineEdit:focus{{border:2px solid {c['accent']};}}"
+            )
+            name_edit.setStyleSheet(input_style)
+        if not dlg.exec():
+            return
+        folder_name = name_edit.text().strip()
+        if not folder_name:
             return
         cur = self.user_conn.cursor()
         try:
@@ -541,6 +1214,18 @@ class UIMixin:
     def clear_detail(self):
         for i in reversed(range(self.detail_layout.count())):
             widget = self.detail_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+        for i in reversed(range(self.detail_info_layout.count())):
+            widget = self.detail_info_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+        for i in reversed(range(self.detail_note_layout.count())):
+            widget = self.detail_note_layout.itemAt(i).widget()
+            if widget is not None:
+                widget.setParent(None)
+        for i in reversed(range(self.detail_ai_layout.count())):
+            widget = self.detail_ai_layout.itemAt(i).widget()
             if widget is not None:
                 widget.setParent(None)
         self.translation_primary_widgets = []

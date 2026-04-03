@@ -1,3 +1,4 @@
+import re
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QFont, QGuiApplication
 from PyQt6.QtWidgets import (
@@ -169,16 +170,21 @@ class NavigationMixin:
             return
         if self.is_english_text(text):
             self.current_page_kind = 'sentence'
-            self.translate_text(text)
+            if hasattr(self, "animate_detail_change") and callable(getattr(self, "animate_detail_change")):
+                self.animate_detail_change(lambda t=text: (self.clear_detail(), self.translate_text(t, skip_clear=True)))
+            else:
+                self.translate_text(text)
             return
         self.clear_detail()
         error_label = QLabel("未找到唯一匹配词条，且当前输入不是英文句子，未触发离线翻译。")
         error_label.setFont(QFont('Segoe UI', 12))
         error_label.setStyleSheet('color: #e06c75;')
-        self.detail_layout.addWidget(error_label)
+        self.detail_info_layout.addWidget(error_label)
 
     def has_query_page(self):
-        return bool(self.current_query) and self.detail_layout.count() > 0
+        if not self.current_query:
+            return False
+        return self.detail_info_layout.count() > 0 or self.detail_note_layout.count() > 0 or self.detail_ai_layout.count() > 0
 
     def capture_current_page_state(self):
         if not self.has_query_page():
@@ -192,6 +198,15 @@ class NavigationMixin:
             if len(self.llm_translation_widgets) >= 2 and self.llm_translation_widgets[1] is not None:
                 llm_visible = self.llm_translation_widgets[1].isVisible()
                 llm_html = self.llm_translation_widgets[1].toHtml()
+        current_scroll = 0
+        if hasattr(self, 'detail_tab_widget'):
+            current_tab = self.detail_tab_widget.currentIndex()
+            if current_tab == 0 and hasattr(self, 'detail_info_tab'):
+                current_scroll = self.detail_info_tab.verticalScrollBar().value()
+            elif current_tab == 1 and hasattr(self, 'detail_note_tab'):
+                current_scroll = self.detail_note_tab.verticalScrollBar().value()
+            elif current_tab == 2 and hasattr(self, 'detail_ai_tab'):
+                current_scroll = self.detail_ai_tab.verticalScrollBar().value()
         return {
             "kind": self.current_page_kind,
             "query": self.current_query,
@@ -199,7 +214,8 @@ class NavigationMixin:
             "llm_visible": llm_visible,
             "llm_html": llm_html,
             "llm_click_count": self.llm_translate_click_count,
-            "scroll_value": self.detail_area.verticalScrollBar().value(),
+            "scroll_value": current_scroll,
+            "current_tab": current_tab if hasattr(self, 'detail_tab_widget') else 0,
             "search_text": self.search_input.text(),
         }
 
@@ -208,14 +224,22 @@ class NavigationMixin:
             return
         kind = state.get("kind", "")
         query = state.get("query", "")
-        if kind == 'word':
-            self.current_page_kind = 'word'
-            self.show_word_detail(query)
-        elif kind == 'sentence':
-            self.current_page_kind = 'sentence'
-            self.translate_text(query)
+        def build():
+            if kind == 'word':
+                self.current_page_kind = 'word'
+                self.clear_detail()
+                self.show_word_detail(query, skip_clear=True)
+            elif kind == 'sentence':
+                self.current_page_kind = 'sentence'
+                self.clear_detail()
+                self.translate_text(query, skip_clear=True)
+            else:
+                return
+
+        if hasattr(self, "animate_detail_change") and callable(getattr(self, "animate_detail_change")):
+            self.animate_detail_change(build)
         else:
-            return
+            build()
         if hasattr(self, 'note_edit'):
             self.note_edit.setPlainText(state.get("note_text", ""))
             self.update_note_preview()
@@ -223,7 +247,16 @@ class NavigationMixin:
             self.show_llm_translation_in_place(state.get("llm_html", ""))
         self.llm_translate_click_count = int(state.get("llm_click_count", 0))
         self.search_input.setText(state.get("search_text", query))
-        self.detail_area.verticalScrollBar().setValue(int(state.get("scroll_value", 0)))
+        if hasattr(self, 'detail_tab_widget'):
+            self.detail_tab_widget.setCurrentIndex(int(state.get("current_tab", 0)))
+            scroll_val = int(state.get("scroll_value", 0))
+            current_tab = self.detail_tab_widget.currentIndex()
+            if current_tab == 0:
+                self.detail_info_tab.verticalScrollBar().setValue(scroll_val)
+            elif current_tab == 1:
+                self.detail_note_tab.verticalScrollBar().setValue(scroll_val)
+            elif current_tab == 2:
+                self.detail_ai_tab.verticalScrollBar().setValue(scroll_val)
 
     def navigate_to_word(self, word):
         target = (word or "").strip()
@@ -236,7 +269,10 @@ class NavigationMixin:
                 if state:
                     self.query_page_stack.append(state)
         self.current_page_kind = 'word'
-        self.show_word_detail(target)
+        if hasattr(self, "animate_detail_change") and callable(getattr(self, "animate_detail_change")):
+            self.animate_detail_change(lambda w=target: (self.clear_detail(), self.show_word_detail(w, skip_clear=True)))
+        else:
+            self.show_word_detail(target)
 
     def add_back_stack_button(self, header_layout):
         if not self.query_page_stack:
@@ -264,13 +300,14 @@ class NavigationMixin:
             return rows[0][0]
         return None
 
-    def show_word_detail(self, word):
+    def show_word_detail(self, word, *, skip_clear=False):
         self.current_page_kind = 'word'
         self.cursor.execute("SELECT * FROM stardict WHERE word = ? COLLATE NOCASE", (word,))
         result = self.cursor.fetchone()
         if not result:
             return
-        self.clear_detail()
+        if not skip_clear:
+            self.clear_detail()
         self.current_query = word
         self.increment_query_count(self.current_query)
         if self.is_in_review(self.current_query):
@@ -305,7 +342,7 @@ class NavigationMixin:
         self.llm_translate_btn.clicked.connect(self.on_llm_translate_clicked)
         header_layout.addWidget(self.llm_translate_btn)
         self.add_back_stack_button(header_layout)
-        self.detail_layout.addWidget(header_widget)
+        self.detail_info_layout.addWidget(header_widget)
         self.update_favorite_button_state(self.current_query)
         self.update_review_button_state(self.current_query)
         self.current_word_label = word_label
@@ -317,13 +354,7 @@ class NavigationMixin:
             phonetic_label.setFont(QFont('Consolas', 14))
             phonetic_label.setStyleSheet('color: #98c379; margin-bottom: 10px;')
             phonetic_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(phonetic_label)
-        if word_data['pos']:
-            pos_label = QLabel(f"词性: {word_data['pos']}")
-            pos_label.setFont(QFont('Segoe UI', 12))
-            pos_label.setStyleSheet('color: #e06c75; margin-bottom: 5px;')
-            pos_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(pos_label)
+            self.detail_info_layout.addWidget(phonetic_label)
         self.translation_primary_widgets = []
         if word_data['translation']:
             trans_label = QLabel(f"中文释义: {word_data['translation']}")
@@ -331,7 +362,7 @@ class NavigationMixin:
             trans_label.setStyleSheet('margin-bottom: 10px;')
             trans_label.setWordWrap(True)
             trans_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(trans_label)
+            self.detail_info_layout.addWidget(trans_label)
             self.translation_primary_widgets = [trans_label]
         self.build_llm_translation_area()
         if word_data['definition']:
@@ -340,59 +371,91 @@ class NavigationMixin:
             def_label.setStyleSheet('color: #d19a66; margin-bottom: 10px;')
             def_label.setWordWrap(True)
             def_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(def_label)
+            self.detail_info_layout.addWidget(def_label)
         if word_data['detail']:
             detail_label = QLabel(f"详细解释:\n{word_data['detail']}")
             detail_label.setFont(QFont('Segoe UI', 11))
             detail_label.setStyleSheet('color: #abb2bf; margin-bottom: 10px;')
             detail_label.setWordWrap(True)
             detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(detail_label)
+            self.detail_info_layout.addWidget(detail_label)
         if word_data['exchange']:
             exchange_label = QLabel(f"词形变化: {word_data['exchange']}")
             exchange_label.setFont(QFont('Segoe UI', 11))
             exchange_label.setStyleSheet('color: #56b6c2; margin-bottom: 10px;')
             exchange_label.setWordWrap(True)
             exchange_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(exchange_label)
-        meta_parts = []
+            self.detail_info_layout.addWidget(exchange_label)
+        
+        # 标签展示区域 - 使用小方框样式
+        tag_widget = QWidget()
+        tag_layout = QHBoxLayout()
+        tag_layout.setContentsMargins(0, 10, 0, 0)
+        tag_layout.setSpacing(8)
+        tag_widget.setLayout(tag_layout)
+        
+        # 标签映射：英文标签 -> (中文显示, 背景颜色)
+        def make_tag(text, bg_color):
+            tag_label = QLabel(text)
+            tag_label.setFont(QFont('Segoe UI', 11))
+            tag_label.setStyleSheet(f'''
+                background-color: {bg_color};
+                color: #ffffff;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-weight: 500;
+            ''')
+            tag_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            return tag_label
+        
         if word_data['collins']:
-            meta_parts.append(f"柯林斯星级: {word_data['collins']}")
+            tag_layout.addWidget(make_tag(f"柯林斯 {word_data['collins']}", "#e06c75"))
         if word_data['oxford']:
-            meta_parts.append("牛津收录")
+            tag_layout.addWidget(make_tag("牛津词典", "#61dafb"))
         if word_data['tag']:
-            meta_parts.append(str(word_data['tag']))
+            tag_text = str(word_data['tag']).strip()
+            # 处理多标签情况：用空格或逗号分割
+            tags = re.split(r'[,，\s]+', tag_text)
+            
+            for tag in tags:
+                tag = tag.strip()
+                if not tag:
+                    continue
+                # 标签映射表
+                tag_map = {
+                    'CET4': ('英语四级', '#98c379'),
+                    'CET6': ('英语六级', '#56b6c2'),
+                    'KY': ('考研', '#d19a66'),
+                    'TOEFL': ('托福', '#e5c07b'),
+                    'IELTS': ('雅思', '#c678dd'),
+                    'GRE': ('GRE', '#e06c75'),
+                }
+                if tag.upper() in tag_map:
+                    chinese_name, color = tag_map[tag.upper()]
+                    tag_layout.addWidget(make_tag(chinese_name, color))
+                else:
+                    tag_layout.addWidget(make_tag(tag.upper(), "#c678dd"))
         if word_data['bnc']:
-            meta_parts.append(f"BNC: {word_data['bnc']}")
-        if word_data['frq']:
-            meta_parts.append(f"语料频次: {word_data['frq']}")
-        if word_data.get('sw') and word_data.get('sw') != word_data['word']:
-            meta_parts.append(f"词干: {word_data['sw']}")
-        if meta_parts:
-            tag_label = QLabel(" | ".join(meta_parts))
-            tag_label.setFont(QFont('Segoe UI', 10))
-            tag_label.setStyleSheet('color: #c678dd; margin-top: 10px;')
-            tag_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(tag_label)
+            tag_layout.addWidget(make_tag(f"BNC {word_data['bnc']}", "#c678dd"))
+        
+        if tag_layout.count() > 0:
+            self.detail_info_layout.addWidget(tag_widget)
         if word_data.get('audio'):
             audio_label = QLabel(f"音频: {word_data['audio']}")
             audio_label.setFont(QFont('Consolas', 10))
             audio_label.setStyleSheet('color: #bbbbbb; margin-top: 6px;')
             audio_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(audio_label)
+            self.detail_info_layout.addWidget(audio_label)
         self.build_words_link_section(word_data['word'])
         self.prepare_llm_translate_context(word_data['word'], True, 'word')
         self.build_note_section()
-        save_note_btn = QPushButton("保存批注")
-        save_note_btn.clicked.connect(self.save_current_note)
-        self.detail_layout.addWidget(save_note_btn)
         self.add_ai_section()
-        self.detail_layout.addStretch()
         self.update_current_query_visuals()
 
-    def translate_text(self, text):
+    def translate_text(self, text, *, skip_clear=False):
         self.current_page_kind = 'sentence'
-        self.clear_detail()
+        if not skip_clear:
+            self.clear_detail()
         self.current_query = text
         self.increment_query_count(self.current_query)
         if self.is_in_review(self.current_query):
@@ -427,20 +490,20 @@ class NavigationMixin:
             self.llm_translate_btn.clicked.connect(self.on_llm_translate_clicked)
             header_layout.addWidget(self.llm_translate_btn)
             self.add_back_stack_button(header_layout)
-            self.detail_layout.addWidget(header_widget)
+            self.detail_info_layout.addWidget(header_widget)
             self.update_favorite_button_state(self.current_query)
             self.update_review_button_state(self.current_query)
             source_label = QLabel("原文:")
             source_label.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
             source_label.setStyleSheet('color: #61dafb; margin-bottom: 5px;')
             source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(source_label)
+            self.detail_info_layout.addWidget(source_label)
             source_text = QLabel(text)
             source_text.setFont(QFont('Segoe UI', 14))
             source_text.setStyleSheet('margin-bottom: 20px;')
             source_text.setWordWrap(True)
             source_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(source_text)
+            self.detail_info_layout.addWidget(source_text)
             self.current_word_label = None
             self.current_word_label_base_text = ""
             self.current_source_text_label = source_text
@@ -449,24 +512,21 @@ class NavigationMixin:
             trans_label.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
             trans_label.setStyleSheet('color: #98c379; margin-bottom: 5px;')
             trans_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(trans_label)
+            self.detail_info_layout.addWidget(trans_label)
             self.translation_primary_widgets = []
             trans_text = QLabel(translated)
             trans_text.setFont(QFont('Segoe UI', 14))
             trans_text.setWordWrap(True)
             trans_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_layout.addWidget(trans_text)
+            self.detail_info_layout.addWidget(trans_text)
             self.translation_primary_widgets = [trans_text]
             self.build_llm_translation_area()
             self.prepare_llm_translate_context(text, False, 'sentence')
             self.build_note_section()
-            save_note_btn = QPushButton("保存批注")
-            save_note_btn.clicked.connect(self.save_current_note)
-            self.detail_layout.addWidget(save_note_btn)
             self.add_ai_section()
             self.update_current_query_visuals()
         except Exception as e:
             error_label = QLabel(f"翻译失败: {str(e)}")
             error_label.setFont(QFont('Segoe UI', 12))
             error_label.setStyleSheet('color: #e06c75;')
-            self.detail_layout.addWidget(error_label)
+            self.detail_info_layout.addWidget(error_label)

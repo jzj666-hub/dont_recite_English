@@ -9,9 +9,18 @@ from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QLabel, QTextBrowser
 
 from search_modules.infrastructure import build_highlighted_text_html
+from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_text
 
 
 class LLMTranslationMixin:
+    def get_ai_prompts(self):
+        raw = self.settings.get("ai_prompts_json", "") if hasattr(self, "settings") else ""
+        merged = dict(default_ai_prompts())
+        user_obj = loads_prompts(raw)
+        for k, v in (user_obj or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                merged[k.strip()] = v
+        return merged
     def prepare_llm_translate_context(self, target_text, is_word, restore_kind):
         self.llm_target_text = target_text
         self.llm_target_is_word = bool(is_word)
@@ -42,8 +51,8 @@ class LLMTranslationMixin:
         if hasattr(self, 'install_ai_selection_context_menu'):
             self.install_ai_selection_context_menu(result_view, "LLM补充翻译")
         title.setVisible(False)
-        self.detail_layout.addWidget(title)
-        self.detail_layout.addWidget(result_view)
+        self.detail_info_layout.addWidget(title)
+        self.detail_info_layout.addWidget(result_view)
         self.llm_translation_widgets = [title, result_view]
 
     def hide_llm_translation_widgets(self):
@@ -92,15 +101,11 @@ class LLMTranslationMixin:
         meaning_rule = "字符串数组，按词性与语义分组，尽可能覆盖常见义项、引申义与高频短语义，至少 4 条。"
         if not is_word:
             meaning_rule = "字符串，给出整句自然中文翻译，可补充一句语气/语境说明。"
-        return (
-            "你是英语学习翻译助手。请严格只输出 JSON 对象，不要输出任何其他字符。\n"
-            "JSON 必须包含三个键：释义、例句、常见用法。\n"
-            f"释义：{meaning_rule}\n"
-            "例句：字符串数组，给2条英文例句，每条后面带中文翻译。\n"
-            "常见用法：字符串数组，给3条高频用法，每条简短。\n"
-            "如果输入是单词，释义必须尽量全，不要只给单一词义。\n"
-            f"输入类型：{'单词' if is_word else '句子'}\n"
-            f"输入内容：{text}"
+        tmpl = prompt_text(self.get_ai_prompts(), "llm_translate_prompt", "")
+        return (tmpl or "").format(
+            meaning_rule=meaning_rule,
+            kind=("单词" if is_word else "句子"),
+            text=text,
         )
 
     def format_llm_translate_output(self, text):
@@ -139,7 +144,10 @@ class LLMTranslationMixin:
             return html.escape(plain)
         if not self.is_in_review(self.current_query):
             return html.escape(plain)
-        highlighted_html, matched = build_highlighted_text_html(plain, self.current_query)
+        # 获取当前主题的高亮颜色
+        highlight_bg = self.colors.get('highlight_bg', '#6b4f00') if hasattr(self, 'colors') else '#6b4f00'
+        highlight_text = self.colors.get('highlight_text', '#ffe9a8') if hasattr(self, 'colors') else '#ffe9a8'
+        highlighted_html, matched = build_highlighted_text_html(plain, self.current_query, highlight_bg, highlight_text)
         if matched:
             return highlighted_html
         return html.escape(plain)
@@ -159,7 +167,7 @@ class LLMTranslationMixin:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "You are a precise bilingual translator."},
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "translator_system", "You are a precise bilingual translator.")},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.0,

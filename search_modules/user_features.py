@@ -28,21 +28,78 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QMenu,
+    QGroupBox,
+    QPlainTextEdit,
+    QScrollArea,
 )
 
 from search_modules.infrastructure import build_highlighted_text_html
+from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_text
 
 
 class UserFeaturesMixin:
+    def get_ai_prompts(self):
+        raw = self.settings.get("ai_prompts_json", "") if hasattr(self, "settings") else ""
+        merged = dict(default_ai_prompts())
+        user_obj = loads_prompts(raw)
+        for k, v in (user_obj or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip():
+                merged[k.strip()] = v
+        return merged
+
     def get_reviewing_word_records(self):
-        cur = self.user_conn.cursor()
-        cur.execute(
-            'SELECT query FROM reviewing ORDER BY COALESCE(last_visited_at, created_at) DESC, created_at DESC',
-        )
-        return cur.fetchall()
+        basis = self.get_reviewing_sort_basis()
+        candidates = self.get_scope_candidates("reviewing", 1)
+        sorted_words = self.sort_words_by_basis(candidates, basis)
+        return [(w,) for w in sorted_words]
 
     def get_reviewing_words(self):
         return [row[0] for row in self.get_reviewing_word_records()]
+
+    def get_basis_options(self, include_self_select=False):
+        options = [
+            ("推荐（查询时间+熟练度加权）", "recommended"),
+            ("根据最近查询时间", "recent"),
+            ("完全随机", "random"),
+            ("根据熟练度", "proficiency"),
+        ]
+        if include_self_select:
+            options.append(("自选择", "self_select"))
+        return options
+
+    def get_reviewing_sort_basis(self):
+        value = (self.settings.get("reviewing_sort_basis", "recommended") or "").strip()
+        valid = {v for _, v in self.get_basis_options(include_self_select=False)}
+        if value in valid:
+            return value
+        return "recommended"
+
+    def init_reviewing_sort_ui(self):
+        if not hasattr(self, 'reviewing_sort_combo'):
+            return
+        combo = self.reviewing_sort_combo
+        combo.blockSignals(True)
+        combo.clear()
+        options = self.get_basis_options(include_self_select=False)
+        for label, value in options:
+            combo.addItem(label, value)
+        basis = self.get_reviewing_sort_basis()
+        for i in range(combo.count()):
+            if combo.itemData(i) == basis:
+                combo.setCurrentIndex(i)
+                break
+        combo.blockSignals(False)
+        combo.currentIndexChanged.connect(self.on_reviewing_sort_basis_changed)
+
+    def on_reviewing_sort_basis_changed(self, *_):
+        if not hasattr(self, 'reviewing_sort_combo'):
+            return
+        basis = self.reviewing_sort_combo.currentData()
+        if not basis:
+            return
+        self.set_setting("reviewing_sort_basis", basis)
+        self.settings["reviewing_sort_basis"] = basis
+        self.refresh_internal_page()
 
     def touch_reviewing_word(self, query):
         if not query:
@@ -84,11 +141,17 @@ class UserFeaturesMixin:
         self.inner_wordcraft_btn.setIcon(self.build_wordcraft_icon())
         self.inner_wordcraft_btn.clicked.connect(self.on_inner_wordcraft_clicked)
         self.inner_tool_bar_layout.insertWidget(1, self.inner_wordcraft_btn)
+
+        # 随机考词
+        self.inner_quiz_btn = QPushButton("随机考词")
+        self.inner_quiz_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.inner_quiz_btn.clicked.connect(self.on_inner_quiz_clicked)
+        self.inner_tool_bar_layout.insertWidget(2, self.inner_quiz_btn)
         self.inner_tool_settings_btn = QPushButton("设置")
         self.inner_tool_settings_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_settings_btn.clicked.connect(self.open_wordcraft_settings_dialog)
         self.inner_tool_settings_btn.setVisible(False)
-        self.inner_tool_bar_layout.insertWidget(2, self.inner_tool_settings_btn)
+        self.inner_tool_bar_layout.insertWidget(3, self.inner_tool_settings_btn)
         self.inner_tool_action_1.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_2.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_1.clicked.connect(self.create_blank_inner_session)
@@ -107,6 +170,332 @@ class UserFeaturesMixin:
         self.load_wordcraft_config()
         self.load_inner_sessions()
         self.update_inner_toolbar_visual()
+        self._init_quiz_panel()
+
+    def _init_quiz_panel(self):
+        if not hasattr(self, "inner_quiz_panel") or self.inner_quiz_panel is None:
+            return
+        # 防止重复初始化导致布局叠加（例如某些情况下重复调用 init_inner_workspace）
+        if self.inner_quiz_panel.layout() is not None:
+            return
+        root = QVBoxLayout()
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+        self.inner_quiz_panel.setLayout(root)
+
+        title = QLabel("随机考词（最多 5 个）")
+        title.setFont(self.make_ui_font(12, True))
+        root.addWidget(title)
+
+        self.quiz_tip = QLabel("点击工具栏“随机考词”开始。每个单词可点“AI 提示”。完成后提交，让 AI 评档并自动更新熟练度。")
+        self.quiz_tip.setWordWrap(True)
+        root.addWidget(self.quiz_tip)
+
+        self.quiz_scroll = QScrollArea()
+        self.quiz_scroll.setWidgetResizable(True)
+        self.quiz_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self.quiz_items_host = QWidget()
+        self.quiz_items_layout = QVBoxLayout()
+        self.quiz_items_layout.setContentsMargins(0, 0, 0, 0)
+        self.quiz_items_layout.setSpacing(10)
+        self.quiz_items_host.setLayout(self.quiz_items_layout)
+        self.quiz_scroll.setWidget(self.quiz_items_host)
+        root.addWidget(self.quiz_scroll, 1)
+
+        btn_row = QWidget()
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_row.setLayout(btn_layout)
+        self.quiz_back_btn = QPushButton("返回会话")
+        self.quiz_back_btn.clicked.connect(self._exit_quiz_panel)
+        btn_layout.addWidget(self.quiz_back_btn)
+        btn_layout.addStretch()
+        self.quiz_submit_btn = QPushButton("提交考核并评档")
+        self.quiz_submit_btn.clicked.connect(self.on_quiz_submit_clicked)
+        btn_layout.addWidget(self.quiz_submit_btn)
+        root.addWidget(btn_row)
+
+        self.quiz_state = {"items": []}
+
+    def _enter_quiz_panel(self):
+        if hasattr(self, "inner_dialog_stack"):
+            self.inner_dialog_stack.setCurrentWidget(self.inner_quiz_panel)
+
+    def _exit_quiz_panel(self):
+        if hasattr(self, "inner_dialog_stack"):
+            self.inner_dialog_stack.setCurrentWidget(self.inner_dialog_editor)
+
+    def get_quiz_candidates(self):
+        cur = self.user_conn.cursor()
+        # 优先 reviewing，其次 favorites，最后 queries
+        cur.execute("SELECT query FROM reviewing")
+        rows = [r[0] for r in cur.fetchall() if (r and r[0])]
+        if len(rows) < 5:
+            cur.execute("SELECT query FROM favorites")
+            rows.extend([r[0] for r in cur.fetchall() if (r and r[0])])
+        if len(rows) < 5:
+            cur.execute("SELECT query FROM queries")
+            rows.extend([r[0] for r in cur.fetchall() if (r and r[0])])
+        seen = set()
+        out = []
+        for q in rows:
+            key = (q or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(q.strip())
+        return out
+
+    def get_word_profile(self, word):
+        cur = self.user_conn.cursor()
+        cur.execute("SELECT proficiency, last_visited_at FROM reviewing WHERE query = ? COLLATE NOCASE", (word,))
+        row = cur.fetchone()
+        proficiency = (row[0] if row else "") or "人上人"
+        cur.execute("SELECT last_at FROM queries WHERE query = ? COLLATE NOCASE", (word,))
+        row2 = cur.fetchone()
+        last_at = (row2[0] if row2 else "") or ""
+        return proficiency, last_at
+
+    def on_inner_quiz_clicked(self):
+        candidates = self.get_quiz_candidates()
+        if not candidates:
+            QMessageBox.information(self, "随机考词", "暂无可考核的单词（reviewing/favorites/queries 都为空）。")
+            return
+        picked = random.sample(candidates, k=min(5, len(candidates)))
+        self.build_quiz_items(picked)
+        self._enter_quiz_panel()
+
+    def build_quiz_items(self, words):
+        # 清空旧 items
+        for i in reversed(range(self.quiz_items_layout.count())):
+            w = self.quiz_items_layout.itemAt(i).widget()
+            if w is not None:
+                w.setParent(None)
+        items = []
+        for w in words:
+            before, last_at = self.get_word_profile(w)
+            box = QGroupBox(w)
+            lay = QVBoxLayout()
+            box.setLayout(lay)
+            meta = QLabel(f"原熟练度：{before}    最近查询：{last_at or '未知'}")
+            lay.addWidget(meta)
+
+            ans = QPlainTextEdit()
+            ans.setPlaceholderText("请输入你对该词的中文释义/解释（越全面越好）")
+            ans.setFixedHeight(64)
+            lay.addWidget(ans)
+
+            hint_row = QWidget()
+            hint_lay = QHBoxLayout()
+            hint_lay.setContentsMargins(0, 0, 0, 0)
+            hint_row.setLayout(hint_lay)
+            hint_btn = QPushButton("AI 提示")
+            hint_lay.addWidget(hint_btn)
+            hint_lay.addStretch()
+            lay.addWidget(hint_row)
+
+            hint_view = QTextBrowser()
+            hint_view.setOpenExternalLinks(False)
+            hint_view.setVisible(False)
+            hint_view.setMinimumHeight(72)
+            hint_view.setStyleSheet("QTextBrowser{border:1px solid #3d3d3d;border-radius:6px;padding:6px;color:#98c379;background:transparent;}")
+            lay.addWidget(hint_view)
+
+            item = {
+                "word": w,
+                "before": before,
+                "last_at": last_at,
+                "answer_widget": ans,
+                "hint_used": False,
+                "hint_view": hint_view,
+                "hint_btn": hint_btn,
+            }
+            hint_btn.clicked.connect(lambda _=False, it=item: self.on_quiz_hint_clicked(it))
+            items.append(item)
+            self.quiz_items_layout.addWidget(box)
+        self.quiz_state = {"items": items}
+
+    def on_quiz_hint_clicked(self, item):
+        word = item.get("word", "")
+        ans_text = item.get("answer_widget").toPlainText().strip() if item.get("answer_widget") else ""
+        url = self.normalize_api_url(self.settings.get('api_url', ''))
+        key = self.settings.get('api_key', '')
+        model = self.get_mid_model_name() or self.get_high_model_name()
+        if not url or not key or not model:
+            QMessageBox.warning(self, "AI 提示失败", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
+            return
+        tmpl = prompt_text(self.get_ai_prompts(), "quiz_hint_prompt", "")
+        prompt = (tmpl or "").format(word=word, answer=ans_text)
+        item["hint_btn"].setEnabled(False)
+        threading.Thread(target=self._quiz_hint_worker, args=(url, key, model, prompt, word), daemon=True).start()
+        item["hint_used"] = True
+
+    def _quiz_hint_worker(self, url, key, model, prompt, word):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "note_ai_system", "You are a helpful English learning assistant for Chinese users.")},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3,
+            "stream": False,
+        }
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = request.Request(url, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"}, method="POST")
+            with request.urlopen(req, timeout=60) as resp:
+                resp_text = resp.read().decode("utf-8", errors="ignore")
+                text = (self.extract_text_from_response(resp_text) or "").strip()
+                self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "hint", "word": word, "text": text})
+        except Exception as e:
+            self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "hint", "word": word, "error": str(e)})
+
+    def on_quiz_submit_clicked(self):
+        items = self.quiz_state.get("items", [])
+        if not items:
+            return
+        payload_items = []
+        for it in items:
+            ans = it["answer_widget"].toPlainText().strip()
+            payload_items.append({
+                "word": it["word"],
+                "before": it["before"],
+                "hint_used": bool(it.get("hint_used")),
+                "last_at": it.get("last_at", ""),
+                "answer": ans,
+            })
+        self.quiz_state["user_answers"] = payload_items
+        url = self.normalize_api_url(self.settings.get('api_url', ''))
+        key = self.settings.get('api_key', '')
+        model = self.get_high_model_name() or self.get_mid_model_name()
+        if not url or not key or not model:
+            QMessageBox.warning(self, "评档失败", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
+            return
+        tmpl = prompt_text(self.get_ai_prompts(), "quiz_grade_prompt", "")
+        prompt = (tmpl or "").format(items_json=json.dumps(payload_items, ensure_ascii=False))
+        self.quiz_submit_btn.setEnabled(False)
+        threading.Thread(target=self._quiz_grade_worker, args=(url, key, model, prompt), daemon=True).start()
+
+    def _quiz_grade_worker(self, url, key, model, prompt):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "json_system", "You are a strict JSON generator.")},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "stream": False,
+        }
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = request.Request(url, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"}, method="POST")
+            with request.urlopen(req, timeout=90) as resp:
+                resp_text = resp.read().decode("utf-8", errors="ignore")
+                text = (self.extract_text_from_response(resp_text) or "").strip()
+                self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "grade", "text": text})
+        except Exception as e:
+            self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "grade", "error": str(e)})
+
+    def on_quiz_hint_result(self, result):
+        word = (result or {}).get("word", "")
+        ok = bool((result or {}).get("ok"))
+        text = (result or {}).get("text", "") if ok else f"提示失败：{(result or {}).get('error', '未知错误')}"
+        for it in self.quiz_state.get("items", []):
+            if (it.get("word") or "").lower() == (word or "").lower():
+                if it.get("hint_view") is not None:
+                    it["hint_view"].setVisible(True)
+                    it["hint_view"].setPlainText(text)
+                if it.get("hint_btn") is not None:
+                    it["hint_btn"].setEnabled(True)
+                break
+
+    def apply_quiz_proficiency_updates(self, results):
+        if not results:
+            return
+        levels = set(self.get_proficiency_levels())
+        cur = self.user_conn.cursor()
+        ts = datetime.now().isoformat(timespec='seconds')
+        for row in results:
+            word = (row.get("word") or "").strip()
+            final = (row.get("final") or "").strip()
+            if not word or final not in levels:
+                continue
+            cur.execute("SELECT 1 FROM reviewing WHERE query = ? COLLATE NOCASE", (word,))
+            exists = cur.fetchone() is not None
+            if exists:
+                cur.execute("UPDATE reviewing SET proficiency = ?, last_visited_at = ? WHERE query = ? COLLATE NOCASE", (final, ts, word))
+            else:
+                cur.execute(
+                    "INSERT INTO reviewing(query, proficiency, created_at, last_visited_at) VALUES(?, ?, ?, ?)",
+                    (word, final, ts, ts),
+                )
+        self.user_conn.commit()
+        self.refresh_internal_page()
+
+    def on_quiz_grade_result(self, result):
+        if hasattr(self, "quiz_submit_btn") and self.quiz_submit_btn is not None:
+            self.quiz_submit_btn.setEnabled(True)
+        if not result or not result.get("ok"):
+            QMessageBox.warning(self, "评档失败", (result or {}).get("error", "未知错误"))
+            return
+        raw = (result.get("text") or "").strip()
+        cleaned = raw
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            obj = json.loads(cleaned)
+        except Exception:
+            QMessageBox.warning(self, "评档失败", "AI 返回内容不是合法 JSON。")
+            return
+        results = obj.get("results", [])
+        overall = obj.get("overall_comment", "")
+        final_lines = obj.get("final_lines", [])
+        if not isinstance(results, list):
+            results = []
+        self.apply_quiz_proficiency_updates(results)
+
+        # 生成会话记录
+        lines = []
+        lines.append("【随机考词-评档结果】")
+        
+        # 添加用户的回答记录
+        user_answers = self.quiz_state.get("user_answers", [])
+        if user_answers:
+            lines.append("\n【用户回答】")
+            for ans in user_answers:
+                word = ans.get("word", "")
+                answer = ans.get("answer", "")
+                hint_used = "使用了提示" if ans.get("hint_used") else "未使用提示"
+                lines.append(f"{word}: {answer} ({hint_used})")
+        
+        # 添加AI评价
+        if isinstance(final_lines, list) and final_lines:
+            lines.append("\n【评档结果】")
+            lines.append("\n".join([str(x) for x in final_lines if str(x).strip()]))
+        else:
+            lines.append("\n【评档结果】")
+            for r in results:
+                if isinstance(r, dict) and r.get("word") and r.get("final"):
+                    lines.append(f"{r['word']}: {r['final']}")
+        if overall:
+            lines.append("\n【总体评价】")
+            lines.append(str(overall))
+        text = "\n".join([x for x in lines if x is not None])
+        
+        # 保存到会话历史
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        title = f"随机考词 [{ts}]"
+        self.create_inner_session(title, "quiz", text, None)
+        self.load_inner_sessions()
+        
+        # 选中新创建的会话
+        if hasattr(self, 'inner_session_list') and self.inner_session_list.count() > 0:
+            self.inner_session_list.setCurrentRow(0)
+            self.on_inner_session_activated(self.inner_session_list.currentItem())
+        
+        self._exit_quiz_panel()
+
 
     def build_wordcraft_icon(self):
         pix = QPixmap(18, 18)
@@ -303,6 +692,43 @@ class UserFeaturesMixin:
         except Exception:
             return None
 
+    def sort_words_by_basis(self, candidates, basis, count=None):
+        rows = list(candidates or [])
+        if not rows:
+            return []
+        limit = len(rows) if count is None else max(1, int(count))
+        max_idx = max(len(self.get_proficiency_levels()) - 1, 1)
+        now = datetime.now()
+        if basis == "random":
+            random.shuffle(rows)
+            return [w for w, _, _ in rows[:limit]]
+        if basis == "recent":
+            sorted_rows = sorted(
+                rows,
+                key=lambda x: self.parse_iso_ts(x[1]) or datetime(1970, 1, 1),
+            )
+            return [w for w, _, _ in sorted_rows[:limit]]
+        if basis == "proficiency":
+            sorted_rows = sorted(
+                rows,
+                key=lambda x: (
+                    self.get_proficiency_index(x[2] or "人上人"),
+                    self.parse_iso_ts(x[1]) or datetime(1970, 1, 1),
+                ),
+            )
+            return [w for w, _, _ in sorted_rows[:limit]]
+        scored = []
+        for w, last_at, proficiency in rows:
+            ts = self.parse_iso_ts(last_at)
+            days = 365 if ts is None else max((now - ts).total_seconds() / 86400.0, 0.0)
+            stale_score = min(days, 60.0) / 60.0
+            prof_idx = self.get_proficiency_index(proficiency or "人上人")
+            weak_score = 1.0 - (prof_idx / max_idx)
+            score = stale_score * 0.65 + weak_score * 0.35
+            scored.append((score, w))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [w for _, w in scored[:limit]]
+
     def select_words_for_wordcraft(self, cfg):
         scope = cfg.get("scope", "reviewing")
         folder_id = int(cfg.get("folder_id", 1) or 1)
@@ -311,8 +737,6 @@ class UserFeaturesMixin:
         candidates = self.get_scope_candidates(scope, folder_id)
         if not candidates:
             return []
-        prof_score_map = {"拉完了": 1, "NPC": 2, "夯": 3, "顶级": 4, "人上人": 5}
-        now = datetime.now()
         if basis == "self_select":
             selected = [w for w in cfg.get("selected_words", []) if isinstance(w, str)]
             chosen = []
@@ -322,37 +746,7 @@ class UserFeaturesMixin:
                 if key in exists and exists[key] not in chosen:
                     chosen.append(exists[key])
             return chosen
-        if basis == "random":
-            tmp = [w for w, _, _ in candidates]
-            random.shuffle(tmp)
-            return tmp[:count]
-        if basis == "recent":
-            sorted_rows = sorted(
-                candidates,
-                key=lambda x: self.parse_iso_ts(x[1]) or datetime(1970, 1, 1),
-                reverse=True,
-            )
-            return [w for w, _, _ in sorted_rows[:count]]
-        if basis == "proficiency":
-            sorted_rows = sorted(
-                candidates,
-                key=lambda x: (
-                    prof_score_map.get((x[2] or "人上人").strip(), 3),
-                    self.parse_iso_ts(x[1]) or datetime(1970, 1, 1),
-                ),
-                reverse=True,
-            )
-            return [w for w, _, _ in sorted_rows[:count]]
-        scored = []
-        for w, last_at, proficiency in candidates:
-            ts = self.parse_iso_ts(last_at)
-            days = 365 if ts is None else max((now - ts).total_seconds() / 86400.0, 0.0)
-            recency = max(0.0, 1.0 - min(days, 60.0) / 60.0)
-            prof = prof_score_map.get((proficiency or "人上人").strip(), 3) / 5.0
-            score = recency * 0.65 + prof * 0.35
-            scored.append((score, w))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [w for _, w in scored[:count]]
+        return self.sort_words_by_basis(candidates, basis, count=count)
 
     def build_wordcraft_scope_options(self):
         options = [("在背单词", "reviewing", 1)]
@@ -378,13 +772,7 @@ class UserFeaturesMixin:
                 scope_combo.setCurrentIndex(idx)
                 break
         basis_combo = QComboBox()
-        basis_options = [
-            ("推荐（查询时间+熟练度加权）", "recommended"),
-            ("根据最近查询时间", "recent"),
-            ("完全随机", "random"),
-            ("根据熟练度", "proficiency"),
-            ("自选择", "self_select"),
-        ]
+        basis_options = self.get_basis_options(include_self_select=True)
         for label, value in basis_options:
             basis_combo.addItem(label, value)
         for idx, (_, value) in enumerate(basis_options):
@@ -406,9 +794,13 @@ class UserFeaturesMixin:
         def refresh_self_select_list():
             self_select_list.clear()
             scope_val, folder_val = scope_combo.currentData()
-            candidates = [w for w, _, _ in self.get_scope_candidates(scope_val, int(folder_val))]
+            rows = self.get_scope_candidates(scope_val, int(folder_val))
+            sorted_words = self.sort_words_by_basis(rows, basis_combo.currentData() or "recommended")
             selected_set = {str(x).strip().lower() for x in cfg.get("selected_words", [])}
-            for w in candidates:
+            if not selected_set:
+                default_count = max(1, int(cfg.get("word_count", 8) or 8))
+                selected_set = {w.lower() for w in sorted_words[:default_count]}
+            for w in sorted_words:
                 item = QListWidgetItem(w)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if w.lower() in selected_set else Qt.CheckState.Unchecked)
@@ -422,6 +814,7 @@ class UserFeaturesMixin:
         refresh_self_select_list()
         sync_basis_state()
         scope_combo.currentIndexChanged.connect(refresh_self_select_list)
+        basis_combo.currentIndexChanged.connect(refresh_self_select_list)
         basis_combo.currentIndexChanged.connect(sync_basis_state)
         form.addRow("词汇范围", scope_combo)
         form.addRow("选择依据", basis_combo)
@@ -649,6 +1042,14 @@ class UserFeaturesMixin:
 
     def on_inner_tool_result(self, result):
         tool = (result or {}).get("tool", "")
+        if tool == "quiz":
+            stage = (result or {}).get("stage", "")
+            if stage == "hint":
+                self.on_quiz_hint_result(result)
+                return
+            if stage == "grade":
+                self.on_quiz_grade_result(result)
+                return
         if tool != "wordcraft":
             return
         stage = (result or {}).get("stage", "generate")
@@ -929,7 +1330,7 @@ class UserFeaturesMixin:
         title = QLabel("words link")
         title.setFont(title.font())
         title.setStyleSheet('color: #61dafb; margin-top: 15px; margin-bottom: 5px;')
-        self.detail_layout.addWidget(title)
+        self.detail_info_layout.addWidget(title)
         add_row = QWidget()
         add_layout = QHBoxLayout()
         add_layout.setContentsMargins(0, 0, 0, 0)
@@ -943,7 +1344,7 @@ class UserFeaturesMixin:
         self.ai_link_suggest_btn = QPushButton("AI 推荐关联词")
         self.ai_link_suggest_btn.clicked.connect(self.on_ai_suggest_links_clicked)
         add_layout.addWidget(self.ai_link_suggest_btn)
-        self.detail_layout.addWidget(add_row)
+        self.detail_info_layout.addWidget(add_row)
         self.word_links_browser = QTextBrowser()
         self.word_links_browser.setOpenLinks(False)
         self.word_links_browser.setOpenExternalLinks(False)
@@ -951,7 +1352,7 @@ class UserFeaturesMixin:
         self.word_links_browser.setMinimumHeight(120)
         self.word_links_browser.setMaximumHeight(220)
         self.word_links_browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        self.detail_layout.addWidget(self.word_links_browser)
+        self.detail_info_layout.addWidget(self.word_links_browser)
         self.refresh_words_link_view(word)
 
     def refresh_words_link_view(self, word):
@@ -1074,8 +1475,7 @@ class UserFeaturesMixin:
         if hasattr(self, 'refresh_llm_translation_highlight'):
             self.refresh_llm_translation_highlight()
         self.refresh_internal_page()
-        if not exists:
-            self.switch_to_internal_with_focus(self.current_query)
+        # 不要在“标记在背”时强制跳转内化态；用户可能只是想继续当前查询页面
 
     def update_current_query_visuals(self):
         in_review = self.is_in_review(self.current_query) if self.current_query else False
@@ -1089,8 +1489,6 @@ class UserFeaturesMixin:
         self.apply_review_highlight_to_detail_labels(in_review)
 
     def apply_review_highlight_to_label(self, label, query, in_review):
-        if label is None:
-            return
         base_text = label.property("_base_plain_text")
         if base_text is None:
             base_text = label.text()
@@ -1098,7 +1496,10 @@ class UserFeaturesMixin:
         if not in_review:
             label.setText(base_text)
             return
-        highlighted_html, matched = build_highlighted_text_html(base_text, query)
+        # 获取当前主题的高亮颜色
+        highlight_bg = self.colors.get('highlight_bg', '#6b4f00') if hasattr(self, 'colors') else '#6b4f00'
+        highlight_text = self.colors.get('highlight_text', '#ffe9a8') if hasattr(self, 'colors') else '#ffe9a8'
+        highlighted_html, matched = build_highlighted_text_html(base_text, query, highlight_bg, highlight_text)
         label.setText(highlighted_html if matched else base_text)
 
     def apply_review_highlight_to_detail_labels(self, in_review):
@@ -1112,8 +1513,11 @@ class UserFeaturesMixin:
 
     def apply_review_style_to_item(self, item, query):
         if self.is_in_review(query):
-            item.setBackground(QColor('#6b4f00'))
-            item.setForeground(QColor('#ffe9a8'))
+            # 获取当前主题的高亮颜色
+            highlight_bg = self.colors.get('highlight_bg', '#6b4f00') if hasattr(self, 'colors') else '#6b4f00'
+            highlight_text = self.colors.get('highlight_text', '#ffe9a8') if hasattr(self, 'colors') else '#ffe9a8'
+            item.setBackground(QColor(highlight_bg))
+            item.setForeground(QColor(highlight_text))
             f = item.font()
             f.setBold(True)
             item.setFont(f)
