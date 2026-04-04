@@ -1,5 +1,6 @@
 import html
 import json
+import os
 import random
 import re
 import threading
@@ -7,7 +8,12 @@ from datetime import datetime
 from urllib.parse import quote, unquote
 from urllib import error, request
 
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QTimer, Qt, QObject, pyqtSignal
+
+class _AIImportSignalHelper(QObject):
+    update_status = pyqtSignal(str)
+    finish = pyqtSignal(bool, str, str)
+    save_data = pyqtSignal(str, list)
 from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QTextDocument
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -15,6 +21,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
+    QFileDialog,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -273,23 +280,34 @@ class UserFeaturesMixin:
                 w.setParent(None)
         items = []
         for w in words:
-            before, last_at = self.get_word_profile(w)
+            p, last_at = self.get_word_profile(w)
+            rel_time = self.format_relative_time(self.parse_iso_ts(last_at)) if last_at else "从未查询"
+            
+            # 使用 QGroupBox 包装每个词的考核项，增加层次感
             box = QGroupBox(w)
+            box.setFont(self.make_ui_font(12, True))
             lay = QVBoxLayout()
+            lay.setContentsMargins(15, 20, 15, 15)
+            lay.setSpacing(10)
             box.setLayout(lay)
-            meta = QLabel(f"原熟练度：{before}    最近查询：{last_at or '未知'}")
+            
+            meta = QLabel(f"原熟练度：{p}    最近查询：{rel_time}")
+            meta.setStyleSheet("color: #999; font-size: 11px; border: none;")
             lay.addWidget(meta)
 
             ans = QPlainTextEdit()
             ans.setPlaceholderText("请输入你对该词的中文释义/解释（越全面越好）")
-            ans.setFixedHeight(64)
+            ans.setFixedHeight(70)
+            ans.setStyleSheet("QPlainTextEdit{background: #252526; border: 1px solid #3e3e42; border-radius: 4px; padding: 6px; color: #d4d4d4;}")
             lay.addWidget(ans)
 
             hint_row = QWidget()
             hint_lay = QHBoxLayout()
             hint_lay.setContentsMargins(0, 0, 0, 0)
             hint_row.setLayout(hint_lay)
-            hint_btn = QPushButton("AI 提示")
+            hint_btn = QPushButton("💡 AI 提示")
+            hint_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            hint_btn.setStyleSheet("QPushButton{padding: 4px 12px;}")
             hint_lay.addWidget(hint_btn)
             hint_lay.addStretch()
             lay.addWidget(hint_row)
@@ -298,12 +316,12 @@ class UserFeaturesMixin:
             hint_view.setOpenExternalLinks(False)
             hint_view.setVisible(False)
             hint_view.setMinimumHeight(72)
-            hint_view.setStyleSheet("QTextBrowser{border:1px solid #3d3d3d;border-radius:6px;padding:6px;color:#98c379;background:transparent;}")
+            hint_view.setStyleSheet("QTextBrowser{border:1px solid #3d3d3d;border-radius:6px;padding:8px;color:#98c379;background: #1a1a1a;}")
             lay.addWidget(hint_view)
 
             item = {
                 "word": w,
-                "before": before,
+                "before": p,
                 "last_at": last_at,
                 "answer_widget": ans,
                 "hint_used": False,
@@ -692,6 +710,21 @@ class UserFeaturesMixin:
         except Exception:
             return None
 
+    def format_relative_time(self, dt):
+        if not dt:
+            return ""
+        now = datetime.now()
+        diff = now - dt
+        seconds = diff.total_seconds()
+        if seconds < 3600:
+            return "不久前"
+        elif seconds < 86400:
+            hours = int(seconds // 3600)
+            return f"{hours}小时前"
+        else:
+            days = int(seconds // 86400)
+            return f"{days}天前"
+
     def sort_words_by_basis(self, candidates, basis, count=None):
         rows = list(candidates or [])
         if not rows:
@@ -790,6 +823,9 @@ class UserFeaturesMixin:
             difficulty_combo.setCurrentIndex(diff_idx)
         self_select_list = QListWidget()
         self_select_list.setMinimumHeight(180)
+        self_select_list.itemClicked.connect(
+            lambda item: item.setCheckState(Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked)
+        )
 
         def refresh_self_select_list():
             self_select_list.clear()
@@ -892,7 +928,9 @@ class UserFeaturesMixin:
         cur = self.user_conn.cursor()
         cur.execute('SELECT id, title, updated_at FROM inner_sessions ORDER BY COALESCE(updated_at, created_at) DESC, id DESC')
         for sid, title, updated_at in cur.fetchall():
-            text = f"{title}  [{(updated_at or '')[:16].replace('T', ' ')}]"
+            dt = self.parse_iso_ts(updated_at)
+            time_str = self.format_relative_time(dt) if dt else (updated_at or '')[:16].replace('T', ' ')
+            text = f"{title}  [{time_str}]"
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, int(sid))
             self.inner_session_list.addItem(item)
@@ -1255,18 +1293,33 @@ class UserFeaturesMixin:
     def refresh_internal_page(self):
         if hasattr(self, 'inner_favorites_list'):
             self.inner_favorites_list.clear()
-            folder_id = self.get_current_folder_id()
-            cur = self.user_conn.cursor()
-            cur.execute('SELECT query FROM favorites WHERE folder_id = ? ORDER BY created_at DESC', (folder_id,))
-            for (q,) in cur.fetchall():
-                item = QListWidgetItem(q)
+            f_id = self.get_current_folder_id()
+            basis = self.fav_sort_combo.currentData() if hasattr(self, 'fav_sort_combo') else "recent"
+            candidates = self.get_scope_candidates("favorites", f_id)
+            sorted_words = self.sort_words_by_basis(candidates, basis)
+            lookup = {c[0]: c[1] for c in candidates}
+            for q in sorted_words:
+                last_at = lookup.get(q, "")
+                dt = self.parse_iso_ts(last_at)
+                rel_time = self.format_relative_time(dt) if dt else ""
+                suffix = f"  [{rel_time}]" if rel_time else ""
+                item = QListWidgetItem(f"{q}{suffix}")
                 item.setData(Qt.ItemDataRole.UserRole, q)
                 self.apply_review_style_to_item(item, q)
                 self.inner_favorites_list.addItem(item)
         if hasattr(self, 'reviewing_words_list'):
             self.reviewing_words_list.clear()
-            for (q,) in self.get_reviewing_word_records():
-                item = QListWidgetItem(q)
+            basis = self.get_reviewing_sort_basis()
+            candidates = self.get_scope_candidates("reviewing", 1) # returns (q, last_at, proficiency)
+            sorted_words = self.sort_words_by_basis(candidates, basis)
+            # 给在背单词也加上相对于“查询时间”的显示
+            lookup = {c[0]: c[1] for c in candidates}
+            for q in sorted_words:
+                last_at = lookup.get(q, "")
+                dt = self.parse_iso_ts(last_at)
+                rel_time = self.format_relative_time(dt) if dt else ""
+                suffix = f"  [{rel_time}]" if rel_time else ""
+                item = QListWidgetItem(f"{q}{suffix}")
                 item.setData(Qt.ItemDataRole.UserRole, q)
                 self.apply_review_style_to_item(item, q)
                 self.reviewing_words_list.addItem(item)
@@ -1418,6 +1471,275 @@ class UserFeaturesMixin:
         resolved = self.lookup_dictionary_word_exact(target) or self.find_unique_dictionary_word(target) or target
         self.search_input.setText(resolved)
         QTimer.singleShot(0, lambda w=resolved: self.safe_navigate_to_linked_word(w))
+
+    def on_import_txt_clicked(self, file_path=None):
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(self, "选择单词本", "", "Text Files (*.txt);;All Files (*)")
+        if not file_path:
+            return
+        
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        cur = self.user_conn.cursor()
+        
+        # 查找可用文件夹名称（处理重名）
+        cur.execute('SELECT id FROM folders WHERE name = ?', (base_name,))
+        if not cur.fetchone():
+            final_name = base_name
+        else:
+            i = 1
+            while True:
+                candidate = f"{base_name}({i})"
+                cur.execute('SELECT id FROM folders WHERE name = ?', (candidate,))
+                if not cur.fetchone():
+                    final_name = candidate
+                    break
+                i += 1
+
+        # 创建文件夹
+        cur.execute('INSERT INTO folders(name) VALUES(?)', (final_name,))
+        f_id = cur.rowcount and cur.lastrowid
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            
+            ts = datetime.now().isoformat(timespec='seconds')
+            added = 0
+            for line in lines:
+                raw_line = line.strip()
+                if not raw_line:
+                    continue
+                # 提取每行开头的第一个单词/短语
+                # 如果是 "apple - adj. 苹果"，提取 "apple"
+                # 如果是 "stand up for", 且没有后续备注，提取整行
+                parts = raw_line.split(None, 1)
+                word = parts[0]
+                if word:
+                    # 简单清理末尾符号
+                    word = word.strip('.,;:!?')
+                    if word:
+                        cur.execute('INSERT OR IGNORE INTO favorites(query, folder_id, created_at) VALUES(?, ?, ?)', (word, f_id, ts))
+                        if cur.rowcount > 0:
+                            added += 1
+            
+            self.user_conn.commit()
+            QMessageBox.information(self, "引泾成功", f"文件：{base_name}\n已创建文件夹：{final_name}\n新增条目：{added}")
+            # 如果提供了 load_favorites_list 就刷新界面
+            if hasattr(self, 'load_favorites_list'):
+                self.load_favorites_list()
+        except Exception as e:
+            QMessageBox.warning(self, "引泾失败", f"处理外部词库时报错：{str(e)}")
+
+    def on_import_ai_clicked(self, file_path=None):
+        """AI 智能解析：读取文件样本 -> AI 分析结构 -> 生成提取代码 -> 执行并导入"""
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(self, "选择任意格式词库文件", "", "All Files (*)")
+        if not file_path:
+            return
+        url = self.normalize_api_url(self.settings.get('api_url', ''))
+        key = self.settings.get('api_key', '')
+        model = self.get_high_model_name() or self.get_mid_model_name()
+        if not url or not key or not model:
+            QMessageBox.warning(self, "AI 配置不完整", "请先在设置中配置 API URL、API Key 和模型名。")
+            return
+        # 读取文件样本（前 500 字符）
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                sample = f.read(500)
+        except Exception as e:
+            QMessageBox.warning(self, "读取失败", f"无法读取文件：{str(e)}")
+            return
+        if not sample.strip():
+            QMessageBox.warning(self, "文件为空", "所选文件没有可读内容。")
+            return
+        if hasattr(self, 'import_status_label'):
+            self.import_status_label.setText("⏳ [1/4] 正在准备并启动后台任务...")
+            self.import_status_label.setStyleSheet('color: #61dafb;')
+        print(f"[AI Import] 发起后台解析线程: {file_path}")
+        if hasattr(self, 'import_ai_btn'):
+            self.import_ai_btn.setEnabled(False)
+            
+        # 确保 helper 跨线程可用
+        if not hasattr(self, '_ai_import_signal_helper'):
+            self._ai_import_signal_helper = _AIImportSignalHelper()
+            self._ai_import_signal_helper.update_status.connect(self._set_import_status_text)
+            self._ai_import_signal_helper.finish.connect(self._ai_import_finish)
+            self._ai_import_signal_helper.save_data.connect(self._ai_import_save)
+            
+        helper = self._ai_import_signal_helper
+            
+        threading.Thread(
+            target=self._ai_import_worker,
+            args=(url, key, model, file_path, sample, helper),
+            daemon=True
+        ).start()
+
+    def _ai_import_worker(self, url, key, model, file_path, sample, helper):
+        try:
+            print("[AI Import] [DEBUG] 线程运行中，开始构建 Prompt")
+            helper.update_status.emit("⏳ [1/4] 正在构建 AI 提示词与请求...")
+            
+            prompt = (
+                "你是一个文件解析助手。用户给你一个文件的前 500 字符样本，你需要分析这个文件的存储结构，"
+                "然后写出一段 Python 代码来提取其中所有的英语单词或短语。\n\n"
+                "**要求：**\n"
+                "1. 你的回复中必须包含且仅包含一个 Python 代码块（用 ```python ... ``` 包裹）\n"
+                "2. 代码必须定义一个函数 `extract_words(file_path: str) -> list[str]`\n"
+                "3. 该函数接收完整的文件路径，返回一个字符串列表，每个元素是一个英语单词或短语\n"
+                "4. 不要导入任何第三方库，只用 Python 标准库（如 re, csv, json, xml 等）\n"
+                "5. 尽可能智能地识别文件结构，提取出所有英语词汇/短语，去除重复\n"
+                "6. 如果文件中有中文释义、音标等附加信息，只提取英文单词部分\n\n"
+                f"**文件名：** {os.path.basename(file_path)}\n\n"
+                f"**文件样本（前 500 字符）：**\n```\n{sample}\n```"
+            )
+            print("[AI Import] [DEBUG] Prompt 构建成功")
+            
+            messages = [
+                {"role": "system", "content": "你是一个精通文件格式解析的 Python 编程助手。只用代码块回答，不要多余解释。"},
+                {"role": "user", "content": prompt}
+            ]
+            
+            print("[AI Import] [DEBUG] 正在导入 json/urllib")
+            import json as _json
+            from urllib import request as _req, error as _err
+            
+            print("[AI Import] [DEBUG] 正在构造 Payload")
+            payload = {"model": model, "messages": messages, "temperature": 0.1, "stream": False}
+            data = _json.dumps(payload).encode("utf-8")
+            
+            print(f"[AI Import] [DEBUG] 准备向 URL 发送请求: {url}")
+            http_req = _req.Request(url, data=data, headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}"
+            }, method="POST")
+            
+            helper.update_status.emit("⏳ [2/4] 正在等待 AI 响应（可能需要 10~30 秒）...")
+            print("[AI Import] [DEBUG] 正在执行 urlopen...")
+            with _req.urlopen(http_req, timeout=120) as resp:
+                print("[AI Import] [DEBUG] urlopen 成功响应")
+                resp_text = resp.read().decode("utf-8", errors="ignore")
+                answer = (self.extract_text_from_response(resp_text) or "").strip()
+            
+            print(f"[AI Import] [DEBUG] AI 原始响应长度: {len(answer)}")
+            if not answer:
+                print("[AI Import] [DEBUG] 响应为空，终止并提示")
+                helper.finish.emit(False, "AI 未返回内容", file_path)
+                return
+            
+            print("[AI Import] [DEBUG] 开始提取代码块")
+            helper.update_status.emit("⏳ [3/4] AI 已响应，正在提取代码并执行...")
+            code = self._extract_code_block(answer)
+            
+            if not code:
+                print("[AI Import] [DEBUG] 未提取到有效的 Python 代码块")
+                helper.finish.emit(False, f"AI 未返回有效的 Python 代码块。\n\nAI 原文：\n{answer[:500]}", file_path)
+                return
+                
+            print(f"[AI Import] [DEBUG] 提取到代码，长度: {len(code)}\n--- AI 回复代码 ---\n{code}\n-------------------")
+            print("[AI Import] [DEBUG] 开始在沙箱中执行文件提取逻辑")
+            words = self._execute_extract_code(code, file_path)
+            
+            if words is None:
+                print("[AI Import] [DEBUG] 沙箱执行失败 (返回了 None)")
+                helper.finish.emit(False, "AI 生成的代码执行失败，请重试。", file_path)
+                return
+                
+            print(f"[AI Import] [DEBUG] 沙箱执行成功，识别单词列表长度: {len(words)}")
+            if not words:
+                print("[AI Import] [DEBUG] 单词列表为空")
+                helper.finish.emit(False, "AI 解析后未提取到任何单词。", file_path)
+                return
+                
+            print("[AI Import] [DEBUG] 开始将单词写入收藏夹 (转主线程)")
+            helper.update_status.emit(f"⏳ [4/4] 提取到 {len(words)} 个单词，正在写入收藏夹...")
+            helper.save_data.emit(file_path, words)
+            print("[AI Import] [DEBUG] 后台线程工作全量完成")
+            
+        except Exception as e:
+            import traceback
+            trace_str = traceback.format_exc()
+            print(f"[AI Import] [ERROR] 线程异常:\n{trace_str}")
+            helper.finish.emit(False, f"AI 导入异常：{type(e).__name__}: {str(e)}", file_path)
+
+
+
+    def _set_import_status_text(self, text):
+        if hasattr(self, 'import_status_label'):
+            self.import_status_label.setText(text)
+            self.import_status_label.setStyleSheet('color: #61dafb;')
+
+    def _extract_code_block(self, text):
+        m = re.search(r'```python\s*\n(.*?)```', text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        m2 = re.search(r'```\s*\n(.*?)```', text, re.DOTALL)
+        if m2:
+            return m2.group(1).strip()
+        return None
+
+    def _execute_extract_code(self, code, file_path):
+        try:
+            namespace = {}
+            exec(code, namespace)
+            extract_fn = namespace.get('extract_words')
+            if not callable(extract_fn):
+                return None
+            result = extract_fn(file_path)
+            if not isinstance(result, list):
+                return None
+            cleaned = []
+            seen = set()
+            for item in result:
+                w = str(item).strip()
+                if not w:
+                    continue
+                key = w.lower()
+                if key not in seen:
+                    seen.add(key)
+                    cleaned.append(w)
+            return cleaned
+        except Exception as e:
+            print(f"[AI Import] 代码执行出错: {e}")
+            return None
+
+    def _ai_import_save(self, file_path, words):
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        cur = self.user_conn.cursor()
+        cur.execute('SELECT id FROM folders WHERE name = ?', (base_name,))
+        if not cur.fetchone():
+            final_name = base_name
+        else:
+            i = 1
+            while True:
+                candidate = f"{base_name}({i})"
+                cur.execute('SELECT id FROM folders WHERE name = ?', (candidate,))
+                if not cur.fetchone():
+                    final_name = candidate
+                    break
+                i += 1
+        cur.execute('INSERT INTO folders(name) VALUES(?)', (final_name,))
+        f_id = cur.lastrowid
+        ts = datetime.now().isoformat(timespec='seconds')
+        added = 0
+        for word in words:
+            cur.execute('INSERT OR IGNORE INTO favorites(query, folder_id, created_at) VALUES(?, ?, ?)', (word, f_id, ts))
+            if cur.rowcount > 0:
+                added += 1
+        self.user_conn.commit()
+        if hasattr(self, 'load_favorites_list'):
+            self.load_favorites_list()
+        self._ai_import_finish(True, f"AI 智能解析成功！\n文件：{base_name}\n已创建文件夹：{final_name}\n识别单词：{len(words)} 个\n新增条目：{added} 个", file_path)
+
+    def _ai_import_finish(self, success, message, file_path):
+        if hasattr(self, 'import_status_label'):
+            color = '#98c379' if success else '#e06c75'
+            self.import_status_label.setText(message)
+            self.import_status_label.setStyleSheet(f'color: {color};')
+        if hasattr(self, 'import_ai_btn'):
+            self.import_ai_btn.setEnabled(True)
+        if not success:
+            QMessageBox.warning(self, "AI 智能解析", message)
+
 
     def safe_navigate_to_linked_word(self, target):
         try:

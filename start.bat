@@ -20,13 +20,18 @@ echo Python is installed
 echo.
 
 echo Checking dependencies...
-pip show PyQt6 >nul 2>&1
-if %errorlevel% neq 0 (
-    echo Installing dependencies...
+set "DEP_MISSING=0"
+pip show PyQt6 >nul 2>&1 || set DEP_MISSING=1
+pip show uvicorn >nul 2>&1 || set DEP_MISSING=1
+pip show fastapi >nul 2>&1 || set DEP_MISSING=1
+pip show edge-tts >nul 2>&1 || set DEP_MISSING=1
+
+if %DEP_MISSING% equ 1 (
+    echo Installing missing dependencies...
     echo Upgrading pip first...
     python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
     echo Installing requirements...
-    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     if %errorlevel% neq 0 (
         echo ERROR: Failed to install dependencies
         pause
@@ -38,7 +43,11 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo Starting application...
+echo Starting TTS Backend Server...
+start /b python tts_server.py
+timeout /t 2 /nobreak >nul
+
+echo Starting main application...
 echo.
 
 python search.py

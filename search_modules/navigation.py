@@ -11,6 +11,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from search_modules.tts_client import get_tts_client
+
 
 class NavigationMixin:
     def on_search_text_changed(self, text):
@@ -22,7 +24,8 @@ class NavigationMixin:
             return
         self.current_search_text = text
         if self.contains_chinese(text):
-            self.all_candidates = self.search_semantic_candidates(text)
+            # 性能优化：中文输入时跳过实时的语义向量搜索，改在按下 Enter 后进行一次性更新
+            self.all_candidates = []
         else:
             self.cursor.execute(
                 """
@@ -164,10 +167,29 @@ class NavigationMixin:
         text = self.search_input.text().strip()
         if not text:
             return
+            
+        # 只要包含中文（或中英混合），直接认定为需要「中译英」长句翻译
+        if self.contains_chinese(text):
+            # 在按下 Enter 时才触发耗时的语义搜索，更新候选词列表
+            self.all_candidates = self.search_semantic_candidates(text)
+            self.loaded_count = 0
+            self.candidates_list.clear()
+            self.load_more_candidates(20)
+
+            self.current_page_kind = 'sentence'
+            if hasattr(self, "animate_detail_change") and callable(getattr(self, "animate_detail_change")):
+                self.animate_detail_change(lambda t=text: (self.clear_detail(), self.translate_text(t, skip_clear=True)))
+            else:
+                self.translate_text(text)
+            return
+            
+        # 否则（全英文等情况），先尝试匹配离线词库的精确词条
         unique_word = self.find_unique_dictionary_word(text)
         if unique_word:
             self.navigate_to_word(unique_word)
             return
+            
+        # 英文词典中没找到对应词条，当作长句进行「英译中」处理
         if self.is_english_text(text):
             self.current_page_kind = 'sentence'
             if hasattr(self, "animate_detail_change") and callable(getattr(self, "animate_detail_change")):
@@ -175,9 +197,10 @@ class NavigationMixin:
             else:
                 self.translate_text(text)
             return
+            
         self.clear_detail()
-        error_label = QLabel("未找到唯一匹配词条，且当前输入不是英文句子，未触发离线翻译。")
-        error_label.setFont(QFont('Segoe UI', 12))
+        error_label = QLabel("未找到唯一匹配词条，且当前输入不包含可翻译内容。")
+        error_label.setFont(self.make_ui_font(12, False))
         error_label.setStyleSheet('color: #e06c75;')
         self.detail_info_layout.addWidget(error_label)
 
@@ -201,11 +224,11 @@ class NavigationMixin:
         current_scroll = 0
         if hasattr(self, 'detail_tab_widget'):
             current_tab = self.detail_tab_widget.currentIndex()
-            if current_tab == 0 and hasattr(self, 'detail_info_tab'):
+            if current_tab == 0 and hasattr(self, 'detail_info_tab') and hasattr(self.detail_info_tab, 'verticalScrollBar'):
                 current_scroll = self.detail_info_tab.verticalScrollBar().value()
-            elif current_tab == 1 and hasattr(self, 'detail_note_tab'):
+            elif current_tab == 1 and hasattr(self, 'detail_note_tab') and hasattr(self.detail_note_tab, 'verticalScrollBar'):
                 current_scroll = self.detail_note_tab.verticalScrollBar().value()
-            elif current_tab == 2 and hasattr(self, 'detail_ai_tab'):
+            elif current_tab == 2 and hasattr(self, 'detail_ai_tab') and hasattr(self.detail_ai_tab, 'verticalScrollBar'):
                 current_scroll = self.detail_ai_tab.verticalScrollBar().value()
         return {
             "kind": self.current_page_kind,
@@ -251,11 +274,11 @@ class NavigationMixin:
             self.detail_tab_widget.setCurrentIndex(int(state.get("current_tab", 0)))
             scroll_val = int(state.get("scroll_value", 0))
             current_tab = self.detail_tab_widget.currentIndex()
-            if current_tab == 0:
+            if current_tab == 0 and hasattr(self, 'detail_info_tab') and hasattr(self.detail_info_tab, 'verticalScrollBar'):
                 self.detail_info_tab.verticalScrollBar().setValue(scroll_val)
-            elif current_tab == 1:
+            elif current_tab == 1 and hasattr(self, 'detail_note_tab') and hasattr(self.detail_note_tab, 'verticalScrollBar'):
                 self.detail_note_tab.verticalScrollBar().setValue(scroll_val)
-            elif current_tab == 2:
+            elif current_tab == 2 and hasattr(self, 'detail_ai_tab') and hasattr(self.detail_ai_tab, 'verticalScrollBar'):
                 self.detail_ai_tab.verticalScrollBar().setValue(scroll_val)
 
     def navigate_to_word(self, word):
@@ -290,14 +313,15 @@ class NavigationMixin:
 
     def find_unique_dictionary_word(self, text):
         cur = self.cursor
-        cur.execute("SELECT word FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 2", (text,))
+        # 1. 第一优先级：完全匹配大小写（使用 COLLATE BINARY 强制区分大小写）
+        cur.execute("SELECT word FROM stardict WHERE word = ? COLLATE BINARY LIMIT 2", (text,))
         rows = cur.fetchall()
         if len(rows) == 1:
             return rows[0][0]
-        cur.execute("SELECT word FROM stardict WHERE word LIKE ? COLLATE NOCASE LIMIT 2", (f"{text}%",))
-        rows = cur.fetchall()
-        if len(rows) == 1:
-            return rows[0][0]
+        
+        # 2. 第二优先级：前缀匹配（暂不强制大小写匹配，但可随用户习惯优化）
+        # 但既然用户要求“按下 Enter 不自动切换大小写”，我们应该只在非强制模式下使用 NOCASE。
+        # 综合考虑，如果没有任何完全匹配，我们返回 None 触发后续逻辑（如句子翻译）
         return None
 
     def show_word_detail(self, word, *, skip_clear=False):
@@ -322,10 +346,43 @@ class NavigationMixin:
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_widget.setLayout(header_layout)
         word_label = QLabel(word_data['word'])
-        word_label.setFont(QFont('Segoe UI', 28, QFont.Weight.Bold))
+        word_label.setFont(self.make_ui_font(28, True))
         word_label.setStyleSheet('color: #61dafb; margin-bottom: 10px;')
         word_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         header_layout.addWidget(word_label)
+
+        # TTS 按钮显示在单词右侧
+        tts_btn = QPushButton("🔊")
+        tts_btn.setFixedSize(36, 32)
+        tts_btn.setToolTip("播放发音 (Edge-TTS)")
+        tts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        tts_btn.setStyleSheet("""
+            QPushButton { 
+                background: transparent; 
+                border: 1px solid #3d3d3d; 
+                border-radius: 6px; 
+                font-size: 16px; 
+                color: #61dafb;
+                padding-bottom: 2px;
+            }
+            QPushButton:hover { 
+                background: #3e3e42; 
+                border-color: #61dafb; 
+            }
+        """)
+        def play_word():
+            text_to_play = word_data['word']
+            is_cn = self.contains_chinese(text_to_play)
+            if is_cn:
+                voice = self.settings.get('tts_voice_cn', 'zh-CN-XiaoxiaoNeural')
+                rate = self.settings.get('tts_rate_cn', '+0%')
+            else:
+                voice = self.settings.get('tts_voice', 'en-US-GuyNeural')
+                rate = self.settings.get('tts_rate', '+0%')
+            get_tts_client().play(text_to_play, voice=voice, rate=rate)
+        tts_btn.clicked.connect(play_word)
+        header_layout.addWidget(tts_btn)
+
         header_layout.addStretch()
         self.favorite_button = QPushButton()
         self.favorite_button.setFixedHeight(32)
@@ -351,14 +408,15 @@ class NavigationMixin:
         self.update_current_query_visuals()
         if word_data['phonetic']:
             phonetic_label = QLabel(f"发音: [{word_data['phonetic']}]")
-            phonetic_label.setFont(QFont('Consolas', 14))
+            # 音标建议使用等宽字体系列，在 make_ui_font 中会自动处理 fallback
+            phonetic_label.setFont(self.make_ui_font(14, False))
             phonetic_label.setStyleSheet('color: #98c379; margin-bottom: 10px;')
             phonetic_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(phonetic_label)
         self.translation_primary_widgets = []
         if word_data['translation']:
             trans_label = QLabel(f"中文释义: {word_data['translation']}")
-            trans_label.setFont(QFont('Segoe UI', 14))
+            trans_label.setFont(self.make_ui_font(14, False))
             trans_label.setStyleSheet('margin-bottom: 10px;')
             trans_label.setWordWrap(True)
             trans_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
@@ -367,21 +425,21 @@ class NavigationMixin:
         self.build_llm_translation_area()
         if word_data['definition']:
             def_label = QLabel(f"英文释义: {word_data['definition']}")
-            def_label.setFont(QFont('Segoe UI', 12))
+            def_label.setFont(self.make_ui_font(12, False))
             def_label.setStyleSheet('color: #d19a66; margin-bottom: 10px;')
             def_label.setWordWrap(True)
             def_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(def_label)
         if word_data['detail']:
             detail_label = QLabel(f"详细解释:\n{word_data['detail']}")
-            detail_label.setFont(QFont('Segoe UI', 11))
+            detail_label.setFont(self.make_ui_font(11, False))
             detail_label.setStyleSheet('color: #abb2bf; margin-bottom: 10px;')
             detail_label.setWordWrap(True)
             detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(detail_label)
         if word_data['exchange']:
             exchange_label = QLabel(f"词形变化: {word_data['exchange']}")
-            exchange_label.setFont(QFont('Segoe UI', 11))
+            exchange_label.setFont(self.make_ui_font(11, False))
             exchange_label.setStyleSheet('color: #56b6c2; margin-bottom: 10px;')
             exchange_label.setWordWrap(True)
             exchange_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
@@ -397,7 +455,7 @@ class NavigationMixin:
         # 标签映射：英文标签 -> (中文显示, 背景颜色)
         def make_tag(text, bg_color):
             tag_label = QLabel(text)
-            tag_label.setFont(QFont('Segoe UI', 11))
+            tag_label.setFont(self.make_ui_font(11, False))
             tag_label.setStyleSheet(f'''
                 background-color: {bg_color};
                 color: #ffffff;
@@ -442,7 +500,7 @@ class NavigationMixin:
             self.detail_info_layout.addWidget(tag_widget)
         if word_data.get('audio'):
             audio_label = QLabel(f"音频: {word_data['audio']}")
-            audio_label.setFont(QFont('Consolas', 10))
+            audio_label.setFont(self.make_ui_font(10, False))
             audio_label.setStyleSheet('color: #bbbbbb; margin-top: 6px;')
             audio_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(audio_label)
@@ -461,9 +519,14 @@ class NavigationMixin:
         if self.is_in_review(self.current_query):
             self.touch_reviewing_word(self.current_query)
         try:
-            if self.translator is None:
-                raise Exception("未检测到可用的 Argos 英译中离线模型")
-            translated = self.translator.translate(text)
+            is_chinese = self.contains_chinese(text)
+            active_translator = self.zh_en_translator if is_chinese else self.translator
+            
+            if active_translator is None:
+                direction = "中译英" if is_chinese else "英译中"
+                raise Exception(f"未检测到可用的 Argos {direction} 离线模型")
+            
+            translated = active_translator.translate(text)
             if not translated:
                 raise Exception("Argos 未返回翻译结果")
             header_widget = QWidget()
@@ -471,7 +534,7 @@ class NavigationMixin:
             header_layout.setContentsMargins(0, 0, 0, 0)
             header_widget.setLayout(header_layout)
             header_title = QLabel("查询")
-            header_title.setFont(QFont('Segoe UI', 16, QFont.Weight.Bold))
+            header_title.setFont(self.make_ui_font(16, True))
             header_title.setStyleSheet('color: #61dafb;')
             header_layout.addWidget(header_title)
             header_layout.addStretch()
@@ -494,28 +557,61 @@ class NavigationMixin:
             self.update_favorite_button_state(self.current_query)
             self.update_review_button_state(self.current_query)
             source_label = QLabel("原文:")
-            source_label.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
+            source_label.setFont(self.make_ui_font(12, True))
             source_label.setStyleSheet('color: #61dafb; margin-bottom: 5px;')
             source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(source_label)
             source_text = QLabel(text)
-            source_text.setFont(QFont('Segoe UI', 14))
+            source_text.setFont(self.make_ui_font(14, False))
             source_text.setStyleSheet('margin-bottom: 20px;')
             source_text.setWordWrap(True)
             source_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-            self.detail_info_layout.addWidget(source_text)
+            
+            # 为长难句/翻译源增加 TTS 播放
+            tts_row = QHBoxLayout()
+            tts_row.addWidget(source_text, 1)
+            tts_btn = QPushButton("🔊 朗读原文")
+            
+            def play_sentence():
+                is_cn = self.contains_chinese(text)
+                if is_cn:
+                    voice = self.settings.get('tts_voice_cn', 'zh-CN-XiaoxiaoNeural')
+                    rate = self.settings.get('tts_rate_cn', '+0%')
+                else:
+                    voice = self.settings.get('tts_voice', 'en-US-GuyNeural')
+                    rate = self.settings.get('tts_rate', '+0%')
+                get_tts_client().play(text, voice=voice, rate=rate)
+            
+            tts_btn.setFixedSize(110, 32)
+            tts_btn.setFont(self.make_ui_font(10, False))
+            tts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            tts_btn.setStyleSheet("""
+                QPushButton { 
+                    background: transparent; 
+                    border: 1px solid #3d3d3d; 
+                    border-radius: 6px; 
+                    color: #98c379;
+                }
+                QPushButton:hover { 
+                    background: #3e3e42; 
+                    border-color: #98c379; 
+                }
+            """)
+            tts_btn.clicked.connect(play_sentence)
+            tts_row.addWidget(tts_btn)
+            self.detail_info_layout.addLayout(tts_row)
             self.current_word_label = None
             self.current_word_label_base_text = ""
             self.current_source_text_label = source_text
             self.update_current_query_visuals()
             trans_label = QLabel("翻译:")
-            trans_label.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
+            trans_label.setFont(self.make_ui_font(12, True))
             trans_label.setStyleSheet('color: #98c379; margin-bottom: 5px;')
             trans_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(trans_label)
             self.translation_primary_widgets = []
             trans_text = QLabel(translated)
-            trans_text.setFont(QFont('Segoe UI', 14))
+            trans_text.setFont(self.make_ui_font(14, False))
             trans_text.setWordWrap(True)
             trans_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(trans_text)
@@ -527,6 +623,6 @@ class NavigationMixin:
             self.update_current_query_visuals()
         except Exception as e:
             error_label = QLabel(f"翻译失败: {str(e)}")
-            error_label.setFont(QFont('Segoe UI', 12))
+            error_label.setFont(self.make_ui_font(12, False))
             error_label.setStyleSheet('color: #e06c75;')
             self.detail_info_layout.addWidget(error_label)

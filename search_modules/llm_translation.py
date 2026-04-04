@@ -40,7 +40,7 @@ class LLMTranslationMixin:
 
     def build_llm_translation_area(self):
         title = QLabel("LLM 补充翻译")
-        title.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
+        title.setFont(self.make_ui_font(12, True))
         title.setStyleSheet('color: #61dafb; margin-top: 8px; margin-bottom: 4px;')
         title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         result_view = QTextBrowser()

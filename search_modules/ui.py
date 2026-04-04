@@ -1,8 +1,8 @@
 from datetime import datetime
 import json
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette, QTextCursor
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QUrl
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette, QTextCursor, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSlider,
     QStackedLayout,
     QTextBrowser,
     QTextEdit,
@@ -25,6 +26,27 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+class ImportDropWidget(QWidget):
+    def __init__(self, parent=None, callback=None, ai_callback=None):
+        super().__init__(parent)
+        self.callback = callback
+        self.ai_callback = ai_callback
+        self.setAcceptDrops(True)
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    def dropEvent(self, event: QDropEvent):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        file_path = urls[0].toLocalFile()
+        if file_path.lower().endswith('.txt') and self.callback:
+            self.callback(file_path)
+        elif self.ai_callback:
+            self.ai_callback(file_path)
+        elif self.callback:
+            self.callback(file_path)
 
 from search_modules.infrastructure import build_highlighted_text_html
 from search_modules.ai_prompts import default_ai_prompts, loads_prompts
@@ -49,33 +71,25 @@ class UIMixin:
         """
         self.apply_font_preferences()
 
-        # 递归刷新现有控件字体 + 非标题字号整体放大 1.4 倍
+        # 递归刷新现有控件字体：更新字体系列，不在这里做累加缩放，防止“设置完字体变两倍大”
         try:
             base = self.make_ui_font(10, False)
+            fams = base.families()
             self.setFont(base)
+            
             for w in self.findChildren(QWidget):
                 f = w.font()
-                fams = base.families()
                 if fams:
                     f.setFamilies(fams)
-                # 标题字号不动：粗体且字号>=16 视为标题
-                try:
-                    is_title = bool(f.bold()) and float(f.pointSizeF()) >= 16.0
-                except Exception:
-                    is_title = False
-                if not is_title:
-                    try:
-                        if float(f.pointSizeF()) > 0:
-                            f.setPointSizeF(float(f.pointSizeF()) * 1.4)
-                    except Exception:
-                        pass
+                # 不再执行乘以 1.4 的操作，由 base 字体统一管理
                 w.setFont(f)
 
-            # 最右侧会话框再额外放大到 1.8 倍（在 1.4 倍基础上）
+            # 最右侧会话框保持原来的 1.8 倍（相对于基础字号 10 的 18pt），不再相对于当前字号做乘法
             if hasattr(self, "inner_dialog_editor") and self.inner_dialog_editor is not None:
                 try:
                     f2 = self.inner_dialog_editor.font()
-                    f2.setPointSizeF(max(1.0, float(f2.pointSizeF()) * (1.8 / 1.4)))
+                    # 直接设定为 18 号字（基础字号 10 * 1.8），或者是保留之前已经扩大的字号但不重复累加
+                    f2.setPointSizeF(18.0)
                     self.inner_dialog_editor.setFont(f2)
                 except Exception:
                     pass
@@ -301,8 +315,9 @@ class UIMixin:
         self.main_tabs.setMovable(False)
         self.main_tabs.currentChanged.connect(self.on_main_tab_changed)
         main_layout.addWidget(self.main_tabs)
+
         ext_page = QWidget()
-        self.main_tabs.addTab(ext_page, "扩展态")
+        self.main_tabs.addTab(ext_page, "溯游")
         root_layout = QHBoxLayout()
         root_layout.setSpacing(20)
         root_layout.setContentsMargins(12, 12, 12, 12)
@@ -323,11 +338,17 @@ class UIMixin:
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_widget.setLayout(header_layout)
-        title_label = QLabel('🔍 英语查词翻译')
+        title_label = QLabel('🌊 溯游 Tracing')
         title_label.setFont(self.make_ui_font(24, True))
         title_label.setStyleSheet('color: #61dafb;')
         title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         header_layout.addWidget(title_label)
+
+        # 溯游寓意标注
+        tracing_meta = QLabel('【溯游态】 逆流而上，穷源竟委；“道阻且长”，真意乃现。')
+        tracing_meta.setFont(self.make_ui_font(10, False))
+        tracing_meta.setStyleSheet('color: #abb2bf; margin-bottom: 5px;')
+        tracing_meta.setWordWrap(True)
         self.study_today_label = QLabel("")
         self.study_today_label.setFont(self.make_ui_font(11, False))
         self.study_today_label.setStyleSheet('color: #ffb86b; margin-left: 12px;')
@@ -339,6 +360,7 @@ class UIMixin:
         self.settings_btn.clicked.connect(self.open_settings_dialog)
         header_layout.addWidget(self.settings_btn)
         left_layout.addWidget(header_widget)
+        left_layout.addWidget(tracing_meta)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText('输入单词或句子...')
         self.search_input.setFont(self.make_ui_font(14, False))
@@ -385,11 +407,14 @@ class UIMixin:
         self.detail_note_layout.setContentsMargins(0, 0, 0, 0)
         self.detail_note_tab.setLayout(self.detail_note_layout)
 
-        self.detail_ai_tab = QWidget()
+        self.detail_ai_tab = QScrollArea()
+        self.detail_ai_tab.setWidgetResizable(True)
+        self.detail_ai_widget = QWidget()
         self.detail_ai_layout = QVBoxLayout()
         self.detail_ai_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.detail_ai_layout.setContentsMargins(0, 0, 0, 0)
-        self.detail_ai_tab.setLayout(self.detail_ai_layout)
+        self.detail_ai_layout.setContentsMargins(12, 12, 12, 12)
+        self.detail_ai_widget.setLayout(self.detail_ai_layout)
+        self.detail_ai_tab.setWidget(self.detail_ai_widget)
 
         self.detail_tab_widget.addTab(self.detail_info_tab, "基础信息")
         self.detail_tab_widget.addTab(self.detail_note_tab, "批注")
@@ -425,11 +450,98 @@ class UIMixin:
         self.favorites_list.itemClicked.connect(self.on_favorite_activated)
         right_layout.addWidget(self.favorites_list)
         self.inner_page = QWidget()
-        self.main_tabs.addTab(self.inner_page, "内化态")
+        self.main_tabs.addTab(self.inner_page, "入海")
+        
+        # 第三态：引泾 (Channeling) - 放到最后
+        import_page = ImportDropWidget(callback=self.on_import_txt_clicked, ai_callback=self.on_import_ai_clicked)
+        self.main_tabs.addTab(import_page, "引泾")
+        import_layout = QVBoxLayout()
+        import_layout.setSpacing(30)
+        import_layout.setContentsMargins(40, 40, 40, 40)
+        import_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        import_page.setLayout(import_layout)
+
+        import_title_label = QLabel('🌾 引泾 Channeling')
+        import_title_label.setFont(self.make_ui_font(28, True))
+        import_title_label.setStyleSheet('color: #e5c07b;')
+        import_layout.addWidget(import_title_label)
+
+        import_meta = QLabel('【引泾】 引渠灌溉，纳四方新词；“疏而导之”，汇入蓄水之池。以此态开启你的语词森林。')
+        import_meta.setFont(self.make_ui_font(12, False))
+        import_meta.setStyleSheet('color: #abb2bf; margin-bottom: 20px;')
+        import_meta.setWordWrap(True)
+        import_layout.addWidget(import_meta)
+
+        self.import_btn = QPushButton("📁 标准导入：选择或拖拽单词本 (.txt)")
+        self.import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_btn.setFixedHeight(120)
+        self.import_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #282c34;
+                border: 2px dashed #e5c07b;
+                border-radius: 15px;
+                color: #e5c07b;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #353b45;
+                border: 2px solid #e5c07b;
+                color: #ffffff;
+            }
+        """)
+        self.import_btn.clicked.connect(lambda: self.on_import_txt_clicked())
+        import_layout.addWidget(self.import_btn)
+
+        self.import_ai_btn = QPushButton("🤖 AI 智能解析：导入任意格式文件")
+        self.import_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_ai_btn.setFixedHeight(120)
+        self.import_ai_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #282c34;
+                border: 2px dashed #61dafb;
+                border-radius: 15px;
+                color: #61dafb;
+                font-size: 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #353b45;
+                border: 2px solid #61dafb;
+                color: #ffffff;
+            }
+        """)
+        self.import_ai_btn.clicked.connect(lambda: self.on_import_ai_clicked())
+        import_layout.addWidget(self.import_ai_btn)
+
+        # 导入状态/日志
+        self.import_status_label = QLabel('')
+        self.import_status_label.setFont(self.make_ui_font(11, False))
+        self.import_status_label.setStyleSheet('color: #98c379;')
+        self.import_status_label.setWordWrap(True)
+        import_layout.addWidget(self.import_status_label)
+
+        import_tip = QLabel('标准导入：适用于每行一个单词的 .txt 文件。\nAI 智能解析：适用于 CSV、Excel 导出、非标准格式等任意文件，AI 会自动识别文件结构并提取单词。\n支持直接拖拽文件到此页面（.txt 走标准流程，其他格式走 AI 解析）。')
+        import_tip.setFont(self.make_ui_font(10, False))
+        import_tip.setStyleSheet('color: #5c6370; font-style: italic;')
+        import_tip.setWordWrap(True)
+        import_layout.addWidget(import_tip)
         inner_layout = QVBoxLayout()
         inner_layout.setSpacing(12)
         inner_layout.setContentsMargins(12, 12, 12, 12)
         self.inner_page.setLayout(inner_layout)
+
+        # 入海标题与寓意标注
+        merging_title_label = QLabel('⛵ 入海 Merging')
+        merging_title_label.setFont(self.make_ui_font(24, True))
+        merging_title_label.setStyleSheet('color: #98c379;')
+        inner_layout.addWidget(merging_title_label)
+        
+        merging_meta = QLabel('【入海】 纳万川入怀，织锦绣于胸。此前之词，今后之我。')
+        merging_meta.setFont(self.make_ui_font(11, False))
+        merging_meta.setStyleSheet('color: #abb2bf; margin-bottom: 10px;')
+        merging_meta.setWordWrap(True)
+        inner_layout.addWidget(merging_meta)
         inner_content = QWidget()
         inner_content_layout = QHBoxLayout()
         inner_content_layout.setContentsMargins(0, 0, 0, 0)
@@ -441,22 +553,41 @@ class UIMixin:
         inner_left_layout.setContentsMargins(0, 0, 0, 0)
         inner_left_layout.setSpacing(12)
         inner_left_panel.setLayout(inner_left_layout)
-        inner_content_layout.addWidget(inner_left_panel, 1)
+        inner_content_layout.addWidget(inner_left_panel, 3)
         inner_fav_title = QLabel("⭐ 收藏夹（当前文件夹）")
-        inner_fav_title.setFont(QFont('Segoe UI', 14, QFont.Weight.Bold))
+        inner_fav_title.setFont(self.make_ui_font(14, True))
         inner_left_layout.addWidget(inner_fav_title)
         self.inner_favorites_list = QListWidget()
         self.inner_favorites_list.itemActivated.connect(self.on_favorite_activated)
         self.inner_favorites_list.itemClicked.connect(self.on_favorite_activated)
+
+        # 收藏夹排序依据
+        fav_sort_row = QWidget()
+        fav_sort_layout = QHBoxLayout()
+        fav_sort_layout.setContentsMargins(0, 0, 0, 0)
+        fav_sort_row.setLayout(fav_sort_layout)
+        fav_sort_label = QLabel("排序依据：")
+        fav_sort_label.setFont(self.make_ui_font(10, False))
+        fav_sort_label.setFixedWidth(80)
+        fav_sort_layout.addWidget(fav_sort_label)
+        self.fav_sort_combo = QComboBox()
+        for label, val in self.get_basis_options():
+            self.fav_sort_combo.addItem(label, val)
+        self.fav_sort_combo.currentIndexChanged.connect(self.refresh_internal_page)
+        fav_sort_layout.addWidget(self.fav_sort_combo, 1)
+
+        inner_left_layout.addWidget(fav_sort_row)
         inner_left_layout.addWidget(self.inner_favorites_list, 1)
         review_title = QLabel("🔥 在背状态单词")
-        review_title.setFont(QFont('Segoe UI', 14, QFont.Weight.Bold))
+        review_title.setFont(self.make_ui_font(14, True))
         inner_left_layout.addWidget(review_title)
         review_sort_row = QWidget()
         review_sort_layout = QHBoxLayout()
         review_sort_layout.setContentsMargins(0, 0, 0, 0)
         review_sort_row.setLayout(review_sort_layout)
-        review_sort_label = QLabel("排序依据")
+        review_sort_label = QLabel("排序依据：")
+        review_sort_label.setFont(self.make_ui_font(10, False))
+        review_sort_label.setFixedWidth(80)
         review_sort_layout.addWidget(review_sort_label)
         self.reviewing_sort_combo = QComboBox()
         review_sort_layout.addWidget(self.reviewing_sort_combo, 1)
@@ -470,7 +601,7 @@ class UIMixin:
         inner_right_layout.setContentsMargins(0, 0, 0, 0)
         inner_right_layout.setSpacing(10)
         inner_right_panel.setLayout(inner_right_layout)
-        inner_content_layout.addWidget(inner_right_panel, 1)
+        inner_content_layout.addWidget(inner_right_panel, 7)
         self.inner_tool_bar = QWidget()
         self.inner_tool_bar_layout = QHBoxLayout()
         self.inner_tool_bar_layout.setContentsMargins(0, 0, 0, 0)
@@ -490,8 +621,8 @@ class UIMixin:
         self.inner_dialog_area.setLayout(self.inner_dialog_area_layout)
         self.inner_session_list = QListWidget()
         self.inner_session_list.setMinimumWidth(120)
-        self.inner_session_list.setMaximumWidth(200)
-        self.inner_dialog_area_layout.addWidget(self.inner_session_list, 1)
+        self.inner_session_list.setMaximumWidth(400)
+        self.inner_dialog_area_layout.addWidget(self.inner_session_list, 2)
         # 右侧会话区：支持在"普通会话文本"和"随机考词面板"之间切换
         self.inner_dialog_host = QWidget()
         self.inner_dialog_stack = QStackedLayout()
@@ -499,10 +630,10 @@ class UIMixin:
         self.inner_dialog_host.setLayout(self.inner_dialog_stack)
         self.inner_dialog_editor = QTextEdit()
         self.inner_dialog_editor.setPlaceholderText("用于 AI 对话或其他特殊用途（待定）")
-        # 放大最右侧"会话框"文本（不是会话历史列表）到原来的 1.8 倍
+        # 放大最右侧"会话框"文本（不是会话历史列表）到 1.8 倍 (基础 10 * 1.8 = 18pt)
         try:
             f = self.inner_dialog_editor.font()
-            f.setPointSizeF(max(1.0, float(f.pointSizeF()) * 1.8))
+            f.setPointSizeF(18.0)
             self.inner_dialog_editor.setFont(f)
         except Exception:
             pass
@@ -510,7 +641,7 @@ class UIMixin:
         self.inner_dialog_stack.addWidget(self.inner_dialog_editor)
         self.inner_dialog_stack.addWidget(self.inner_quiz_panel)
         self.inner_dialog_stack.setCurrentWidget(self.inner_dialog_editor)
-        self.inner_dialog_area_layout.addWidget(self.inner_dialog_host, 4)
+        self.inner_dialog_area_layout.addWidget(self.inner_dialog_host, 5)
         inner_right_layout.addWidget(self.inner_dialog_area, 1)
         self.inner_confirm_btn = QPushButton("确认已选中不懂片段")
         self.inner_confirm_btn.setVisible(False)
@@ -704,6 +835,8 @@ class UIMixin:
             )
         if hasattr(self, 'reviewing_sort_combo'):
             self.reviewing_sort_combo.setStyleSheet(input_style)
+        if hasattr(self, 'fav_sort_combo'):
+            self.fav_sort_combo.setStyleSheet(input_style)
         if hasattr(self, 'inner_session_list'):
             self.inner_session_list.setStyleSheet(
                 f"QListWidget{{background-color:{c['widget_bg']};border:1px solid {c['border']};border-radius:8px;color:{c['text']};padding:5px;}}QListWidget::item{{padding:8px;border-bottom:1px solid {c['bg_alt']};}}QListWidget::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
@@ -795,6 +928,59 @@ class UIMixin:
         model_mid_edit.setText(self.get_mid_model_name())
         model_high_edit = QLineEdit()
         model_high_edit.setText(self.get_high_model_name())
+        
+        # TTS 英文设置
+        tts_en_voices = [
+            ("美式英语 - Guy (男)", "en-US-GuyNeural"),
+            ("美式英语 - Aria (女)", "en-US-AriaNeural"),
+            ("英式英语 - Thomas (男)", "en-GB-ThomasNeural"),
+            ("英式英语 - Sonia (女)", "en-GB-SoniaNeural"),
+        ]
+        tts_cn_voices = [
+            ("中文普通话 - 晓晓 (女)", "zh-CN-XiaoxiaoNeural"),
+            ("中文普通话 - 云希 (男)", "zh-CN-YunxiNeural"),
+            ("中文普通话 - 晓依 (女)", "zh-CN-XiaoyiNeural"),
+        ]
+
+        def create_rate_control(pref_key):
+            container = QWidget()
+            layout = QHBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            container.setLayout(layout)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(-100, 100)
+            try:
+                rate_str = self.settings.get(pref_key, '+0%')
+                val = int(rate_str.replace('%', ''))
+                slider.setValue(val)
+            except:
+                slider.setValue(0)
+            label = QLabel(f"{'+' if slider.value() > 0 else ''}{slider.value()}%")
+            label.setFixedWidth(50)
+            slider.valueChanged.connect(lambda v: label.setText(f"{'+' if v > 0 else ''}{v}%"))
+            layout.addWidget(slider, 1)
+            layout.addWidget(label)
+            return slider, container
+
+        tts_voice_combo = QComboBox()
+        for label, val in tts_en_voices:
+            tts_voice_combo.addItem(label, val)
+        curr_en = self.settings.get('tts_voice', 'en-US-GuyNeural')
+        for i in range(tts_voice_combo.count()):
+            if tts_voice_combo.itemData(i) == curr_en:
+                tts_voice_combo.setCurrentIndex(i)
+                break
+        tts_rate_slider, tts_rate_container = create_rate_control('tts_rate')
+
+        tts_voice_cn_combo = QComboBox()
+        for label, val in tts_cn_voices:
+            tts_voice_cn_combo.addItem(label, val)
+        curr_cn = self.settings.get('tts_voice_cn', 'zh-CN-XiaoxiaoNeural')
+        for i in range(tts_voice_cn_combo.count()):
+            if tts_voice_cn_combo.itemData(i) == curr_cn:
+                tts_voice_cn_combo.setCurrentIndex(i)
+                break
+        tts_rate_cn_slider, tts_rate_cn_container = create_rate_control('tts_rate_cn')
         font_english_edit = QComboBox()
         font_chinese_edit = QComboBox()
         font_english_edit.setEditable(True)
@@ -977,9 +1163,36 @@ class UIMixin:
             api_key_edit.setStyleSheet(input_style)
             model_mid_edit.setStyleSheet(input_style)
             model_high_edit.setStyleSheet(input_style)
+            tts_voice_combo.setStyleSheet(input_style)
+            tts_voice_cn_combo.setStyleSheet(input_style)
             font_english_edit.setStyleSheet(input_style)
             font_chinese_edit.setStyleSheet(input_style)
             ai_prompts_json_edit.setStyleSheet(input_style)
+            
+            # 为滑动条应用美化样式
+            slider_style = f"""
+                QSlider::groove:horizontal {{
+                    border: 1px solid {c['border']};
+                    height: 8px;
+                    background: {c['bg_alt']};
+                    margin: 2px 0;
+                    border-radius: 4px;
+                }}
+                QSlider::handle:horizontal {{
+                    background: {c['accent']};
+                    border: 1px solid {c['accent']};
+                    width: 18px;
+                    height: 18px;
+                    margin: -5px 0;
+                    border-radius: 9px;
+                }}
+                QSlider::handle:horizontal:hover {{
+                    background: {c['accent_hover']};
+                }}
+            """
+            tts_rate_slider.setStyleSheet(slider_style)
+            tts_rate_cn_slider.setStyleSheet(slider_style)
+            
             # 为所有分类编辑框应用样式
             for edit in all_prompt_edits.values():
                 edit.setStyleSheet(input_style)
@@ -990,6 +1203,10 @@ class UIMixin:
         form.addRow("API Key", api_key_edit)
         form.addRow("中级模型名", model_mid_edit)
         form.addRow("高级模型名", model_high_edit)
+        form.addRow("TTS 语音 (英文)", tts_voice_combo)
+        form.addRow("TTS 语速 (英文)", tts_rate_container)
+        form.addRow("TTS 语音 (中文)", tts_voice_cn_combo)
+        form.addRow("TTS 语速 (中文)", tts_rate_cn_container)
         form.addRow("英文字体", font_english_edit)
         form.addRow("中文字体", font_chinese_edit)
         form.addRow("AI 提示词", ai_prompts_tabs)
@@ -1022,6 +1239,14 @@ class UIMixin:
             high_model = model_high_edit.text().strip()
             self.set_setting('model_high', high_model)
             self.set_setting('model', high_model)
+            self.set_setting('tts_voice', tts_voice_combo.currentData())
+            rate_val = tts_rate_slider.value()
+            self.set_setting('tts_rate', f"{'+' if rate_val >= 0 else ''}{rate_val}%")
+
+            self.set_setting('tts_voice_cn', tts_voice_cn_combo.currentData())
+            rate_cn_val = tts_rate_cn_slider.value()
+            self.set_setting('tts_rate_cn', f"{'+' if rate_cn_val >= 0 else ''}{rate_cn_val}%")
+            
             eng_val = (font_english_edit.currentData() or font_english_edit.currentText() or "").strip()
             zh_val = (font_chinese_edit.currentData() or font_chinese_edit.currentText() or "").strip()
             self.set_setting('font_english', eng_val or 'Segoe UI')
@@ -1061,7 +1286,7 @@ class UIMixin:
 
     def build_note_section(self):
         note_title = QLabel("批注")
-        note_title.setFont(QFont('Segoe UI', 12, QFont.Weight.Bold))
+        note_title.setFont(self.make_ui_font(12, True))
         note_title.setStyleSheet('color: #61dafb; margin-top: 15px; margin-bottom: 5px;')
         self.detail_note_layout.addWidget(note_title)
         save_note_btn = QPushButton("保存批注")
@@ -1212,22 +1437,19 @@ class UIMixin:
             self.update_review_button_state(self.current_query)
 
     def clear_detail(self):
-        for i in reversed(range(self.detail_layout.count())):
-            widget = self.detail_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setParent(None)
-        for i in reversed(range(self.detail_info_layout.count())):
-            widget = self.detail_info_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setParent(None)
-        for i in reversed(range(self.detail_note_layout.count())):
-            widget = self.detail_note_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setParent(None)
-        for i in reversed(range(self.detail_ai_layout.count())):
-            widget = self.detail_ai_layout.itemAt(i).widget()
-            if widget is not None:
-                widget.setParent(None)
+        def clear_layout(layout):
+            if layout is None: return
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                elif item.layout():
+                    clear_layout(item.layout())
+
+        clear_layout(self.detail_layout)
+        clear_layout(self.detail_info_layout)
+        clear_layout(self.detail_note_layout)
+        clear_layout(self.detail_ai_layout)
         self.translation_primary_widgets = []
         self.llm_translation_widgets = []
         self.note_preview_cache_key = None

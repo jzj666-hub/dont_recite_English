@@ -87,10 +87,10 @@ class BootstrapMixin:
 
     def init_translator(self):
         self.translator = None
-        from_code = "en"
-        to_code = "zh"
-        self.translator = self.get_local_translation(from_code, to_code)
-        self.translator_available = self.translator is not None
+        self.zh_en_translator = None
+        self.translator = self.get_local_translation("en", "zh")
+        self.zh_en_translator = self.get_local_translation("zh", "en")
+        self.translator_available = self.translator is not None or self.zh_en_translator is not None
 
     def get_local_translation(self, from_code, to_code):
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -161,6 +161,12 @@ class BootstrapMixin:
             self.set_setting('study_minutes_today', '0')
             self.settings['study_minutes_date'] = today
             self.settings['study_minutes_today'] = '0'
+        if 'tts_voice' not in self.settings:
+            self.set_setting('tts_voice', 'en-US-GuyNeural')
+            self.settings['tts_voice'] = 'en-US-GuyNeural'
+        if 'tts_rate' not in self.settings:
+            self.set_setting('tts_rate', '+0%')
+            self.settings['tts_rate'] = '+0%'
 
     def set_setting(self, key, value):
         cur = self.user_conn.cursor()

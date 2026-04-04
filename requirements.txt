@@ -1,2 +1,5 @@
-PyQt6==6.6.1
+PyQt6
 argostranslate
+fastapi
+uvicorn
+edge-tts

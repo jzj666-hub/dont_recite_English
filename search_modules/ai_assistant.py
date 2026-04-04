@@ -213,6 +213,9 @@ class AIAssistantMixin:
             if isinstance(k, str) and isinstance(v, str) and k.strip():
                 merged[k.strip()] = v
         return merged
+    def _toggle_list_item_check(self, item):
+        item.setCheckState(Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked)
+
     def setup_ai_chat_shortcuts(self):
         self.ai_chat_shortcut = QShortcut(QKeySequence('Ctrl+U'), self)
         self.ai_chat_shortcut.activated.connect(self.open_ai_chat_window)
@@ -496,6 +499,7 @@ class AIAssistantMixin:
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
             list_widget.addItem(item)
+        list_widget.itemClicked.connect(self._toggle_list_item_check)
         layout.addWidget(list_widget)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dlg.accept)
@@ -518,12 +522,15 @@ class AIAssistantMixin:
         ai_title.setStyleSheet('color: #61dafb; margin-top: 15px; margin-bottom: 5px;')
         self.detail_ai_layout.addWidget(ai_title)
         self.ai_options_list = QListWidget()
-        self.ai_options_list.setFixedHeight(180)
+        self.ai_options_list.setMinimumHeight(350)
+        self.ai_options_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.ai_options_list.setStyleSheet(self.ai_options_list.styleSheet() + "\nQListWidget{border:none;background:transparent;}")
         for t in ["自然解释", "相关短语列举", "固定搭配列举", "词汇变形", "英语语境词语用法", "例句用法", "AI助记", "找近义词", "找反义词"]:
             item = QListWidgetItem(t)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             self.ai_options_list.addItem(item)
+        self.ai_options_list.itemClicked.connect(self._toggle_list_item_check)
         self.detail_ai_layout.addWidget(self.ai_options_list)
         self.ai_free_input = QLineEdit()
         self.ai_free_input.setPlaceholderText("自由提问（可选）")
@@ -550,6 +557,8 @@ class AIAssistantMixin:
             return
         prompt = self.build_ai_prompt(self.current_query, selections, free_q)
         self.ai_generate_btn.setEnabled(False)
+        if hasattr(self, 'detail_tab_widget'):
+            self.detail_tab_widget.setCurrentIndex(1)
         threading.Thread(target=self._ai_request_worker, args=(url, key, model, prompt), daemon=True).start()
 
     def build_ai_prompt(self, query, selections, free_q):
