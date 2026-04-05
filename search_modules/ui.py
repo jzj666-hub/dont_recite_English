@@ -5,6 +5,7 @@ from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QUrl
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette, QTextCursor, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
     QVBoxLayout,
     QWidget,
+    QGroupBox,
 )
 
 class ImportDropWidget(QWidget):
@@ -526,6 +528,58 @@ class UIMixin:
         import_tip.setStyleSheet('color: #5c6370; font-style: italic;')
         import_tip.setWordWrap(True)
         import_layout.addWidget(import_tip)
+
+        # 导出部分
+        export_group = QGroupBox("📦 词条导出")
+        export_group.setFont(self.make_ui_font(14, True))
+        export_group.setStyleSheet("QGroupBox{ color: #98c379; border: 1px solid #3d3d3d; border-radius: 8px; margin-top: 20px; padding: 20px; }")
+        export_layout = QVBoxLayout()
+        export_group.setLayout(export_layout)
+        
+        export_row = QHBoxLayout()
+        export_row.setSpacing(10)
+        self.export_source_combo = QComboBox()
+        self.export_source_combo.setFixedHeight(40)
+        self.export_source_combo.setMinimumWidth(180)
+        export_row.addWidget(self.export_source_combo, 1)
+
+        self.export_include_trans_cb = QCheckBox("加翻译")
+        self.export_include_phonetic_cb = QCheckBox("加音标")
+        export_row.addWidget(self.export_include_trans_cb)
+        export_row.addWidget(self.export_include_phonetic_cb)
+
+        self.export_format_combo = QComboBox()
+        self.export_format_combo.setFixedHeight(40)
+        self.export_format_combo.addItems([".txt", ".csv", ".md", ".json"])
+        export_row.addWidget(self.export_format_combo)
+        
+        self.export_btn_ui = QPushButton("导出")
+        self.export_btn_ui.setFixedHeight(40)
+        self.export_btn_ui.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_btn_ui.setStyleSheet("""
+            QPushButton {
+                background-color: #98c379;
+                color: #1e1e1e;
+                border-radius: 6px;
+                font-weight: bold;
+                padding: 0 20px;
+            }
+            QPushButton:hover {
+                background-color: #b1d69d;
+            }
+        """)
+        self.export_btn_ui.clicked.connect(self.on_export_words_clicked)
+        export_row.addWidget(self.export_btn_ui)
+        export_layout.addLayout(export_row)
+        
+        export_desc = QLabel("支持从一个特定的收藏夹或者“在背状态”的单词列表中导出所有查询词。")
+        export_desc.setFont(self.make_ui_font(10, False))
+        export_desc.setStyleSheet("color: #abb2bf;")
+        export_layout.addWidget(export_desc)
+        import_layout.addWidget(export_group)
+
+        if hasattr(self, 'init_export_ui'):
+            self.init_export_ui()
         inner_layout = QVBoxLayout()
         inner_layout.setSpacing(12)
         inner_layout.setContentsMargins(12, 12, 12, 12)
@@ -1165,6 +1219,7 @@ class UIMixin:
             model_high_edit.setStyleSheet(input_style)
             tts_voice_combo.setStyleSheet(input_style)
             tts_voice_cn_combo.setStyleSheet(input_style)
+            self.export_source_combo.setStyleSheet(input_style)
             font_english_edit.setStyleSheet(input_style)
             font_chinese_edit.setStyleSheet(input_style)
             ai_prompts_json_edit.setStyleSheet(input_style)

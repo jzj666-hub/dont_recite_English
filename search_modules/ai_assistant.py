@@ -525,7 +525,13 @@ class AIAssistantMixin:
         self.ai_options_list.setMinimumHeight(350)
         self.ai_options_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.ai_options_list.setStyleSheet(self.ai_options_list.styleSheet() + "\nQListWidget{border:none;background:transparent;}")
-        for t in ["自然解释", "相关短语列举", "固定搭配列举", "词汇变形", "英语语境词语用法", "例句用法", "AI助记", "找近义词", "找反义词"]:
+        is_cn = self.contains_chinese(self.current_query)
+        if is_cn:
+            options = ["查询相关单词", "查询相关固定搭配或短语", "查询英语语境下的该中文表达转化", "自然解释", "AI助记"]
+        else:
+            options = ["自然解释", "相关短语列举", "固定搭配列举", "词汇变形", "英语语境词语用法", "例句用法", "AI助记", "找近义词", "找反义词"]
+        
+        for t in options:
             item = QListWidgetItem(t)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
@@ -562,15 +568,23 @@ class AIAssistantMixin:
         threading.Thread(target=self._ai_request_worker, args=(url, key, model, prompt), daemon=True).start()
 
     def build_ai_prompt(self, query, selections, free_q):
+        is_cn = self.contains_chinese(query)
         parts = []
-        parts.append("你是英语学习助手。输出必须直接、准确、可执行，不要寒暄。")
-        parts.append("总要求：中文说明为主；必要时给英文例子+中译；避免空泛描述。")
+        if is_cn:
+            parts.append("你是英语学习助手。当前用户正在进行【中译英】搜索，请从地道英语表达的角度进行指导。")
+            parts.append("总要求：输出需地道，重点突出不同英文表达间的语境差异；必要时提供中英对比例句。")
+        else:
+            parts.append("你是英语学习助手。输出必须直接、准确、可执行，不要寒暄。")
+            parts.append("总要求：中文说明为主；必要时给英文例子+中译；避免空泛描述。")
+
         if selections:
             parts.append("请严格按选中任务逐项输出，每项单独成段：")
             for s in selections:
                 parts.append(f"- {s}：{self.get_ai_option_instruction(s)}")
         else:
-            parts.append(f"- 自然解释：{self.get_ai_option_instruction('自然解释')}")
+            default_opt = "查询相关单词" if is_cn else "自然解释"
+            parts.append(f"- {default_opt}：{self.get_ai_option_instruction(default_opt)}")
+        
         if free_q:
             parts.append(f"自由提问：{free_q}")
         parts.append(f"目标词/句：{query}")
@@ -579,7 +593,10 @@ class AIAssistantMixin:
 
     def get_ai_option_instruction(self, option):
         instructions = {
-            "自然解释": "先给核心含义，再给常见语气/使用场景，最后给1条最自然的英文例句和中文翻译。",
+            "查询相关单词": "列出与该中文意思相关的5-8个核心英语单词，标注词性并附带简短中文义。",
+            "查询相关固定搭配或短语": "列出与该中文词义关联度最高的4-6个英语短语或固定搭配，并各给一个地道例句。",
+            "查询英语语境下的该中文表达转化": "说明该中文在口语、写作、商务等不同英语场景下的地道对应表达，并给出典型句型。",
+            "自然解释": "解释该词项的核心含义与用法（针对中文搜索，重点解释其对应的英文语感差异），并给出一句最自然的英文例句。",
             "相关短语列举": "列出4-8个高频相关短语，每个短语给中文义和1个简短例句。",
             "固定搭配列举": "列出最常用固定搭配（动词/介词/名词搭配），按“搭配+中文义+例句”格式输出。",
             "词汇变形": "给出词性与常见变形（时态、复数、比较级等），并说明每种变形最常见用法。",

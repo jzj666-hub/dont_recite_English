@@ -178,6 +178,8 @@ class UserFeaturesMixin:
         self.load_inner_sessions()
         self.update_inner_toolbar_visual()
         self._init_quiz_panel()
+        if hasattr(self, 'init_export_ui'):
+            self.init_export_ui()
 
     def _init_quiz_panel(self):
         if not hasattr(self, "inner_quiz_panel") or self.inner_quiz_panel is None:
@@ -1956,6 +1958,8 @@ class UserFeaturesMixin:
             cur_item = self.folders_list.currentItem()
             if cur_item:
                 self.current_folder_id = int(cur_item.data(Qt.ItemDataRole.UserRole))
+        if hasattr(self, 'init_export_ui'):
+            self.init_export_ui()
         self.refresh_internal_page()
 
     def on_folder_changed(self, item):
@@ -1968,3 +1972,129 @@ class UserFeaturesMixin:
         if self.current_query and hasattr(self, 'review_button'):
             self.update_review_button_state(self.current_query)
         self.refresh_internal_page()
+        if hasattr(self, 'init_export_ui'):
+            self.init_export_ui()
+    def init_export_ui(self):
+        if not hasattr(self, 'export_source_combo') or self.export_source_combo is None:
+            return
+        combo = self.export_source_combo
+        combo.blockSignals(True)
+        prev_idx = combo.currentIndex()
+        combo.clear()
+        options = self.build_wordcraft_scope_options()
+        for label, scope, f_id in options:
+            combo.addItem(label, (scope, f_id))
+        if prev_idx >= 0 and prev_idx < combo.count():
+            combo.setCurrentIndex(prev_idx)
+        combo.blockSignals(False)
+
+    def on_export_words_clicked(self):
+        if not hasattr(self, 'export_source_combo') or self.export_source_combo is None:
+            return
+        data = self.export_source_combo.currentData()
+        if not data:
+            return
+        scope, folder_id = data
+        source_label = self.export_source_combo.currentText()
+        
+        candidates = self.get_scope_candidates(scope, folder_id)
+        words = [row[0] for row in candidates]
+        
+        if not words:
+            QMessageBox.information(self, "导出提示", f"来源“{source_label}”中没有单词可供导出。")
+            return
+
+        fmt = self.export_format_combo.currentText() if hasattr(self, 'export_format_combo') else ".txt"
+        include_trans = self.export_include_trans_cb.isChecked() if hasattr(self, 'export_include_trans_cb') else False
+        include_phon = self.export_include_phonetic_cb.isChecked() if hasattr(self, 'export_include_phonetic_cb') else False
+
+        if ".csv" in fmt: ext = ".csv"
+        elif ".md" in fmt: ext = ".md"
+        elif ".json" in fmt: ext = ".json"
+        else: ext = ".txt"
+
+        filter_map = {
+            ".csv": "CSV Files (*.csv)",
+            ".md": "Markdown Files (*.md)",
+            ".json": "JSON Files (*.json)",
+            ".txt": "Text Files (*.txt)"
+        }
+        filter_str = filter_map.get(ext, "All Files (*)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出单词本", f"{source_label}_export{ext}", filter_str)
+        if not file_path:
+            return
+            
+        try:
+            rows = []
+            json_data = []
+            cur = self.cursor
+            for w in words:
+                trans = ""
+                phon = ""
+                if include_trans or include_phon:
+                    cur.execute("SELECT translation, phonetic FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1", (w,))
+                    row = cur.fetchone()
+                    if row:
+                        trans = row[0] or ""
+                        phon = row[1] or ""
+                
+                out_w = w
+                out_phon = f"[{phon}]" if phon and include_phon else ""
+                
+                if include_trans and trans:
+                    trans = trans.replace("\r", " ").replace("\n", " ").strip()
+                else:
+                    trans = ""
+
+                if ext == ".csv":
+                    r = [out_w]
+                    if include_phon: r.append(out_phon)
+                    if include_trans: r.append(trans)
+                    rows.append(r)
+                elif ext == ".md":
+                    # Markdown 表格行构造
+                    r = [f"**{out_w}**"]
+                    if include_phon: r.append(out_phon if out_phon else "-")
+                    if include_trans: r.append(trans if trans else "-")
+                    rows.append("| " + " | ".join(r) + " |")
+                elif ext == ".json":
+                    item = {"word": out_w}
+                    if include_phon: item["phonetic"] = phon
+                    if include_trans: item["translation"] = trans
+                    json_data.append(item)
+                else:
+                    parts = [out_w]
+                    if out_phon: parts.append(out_phon)
+                    if trans: parts.append("- " + trans)
+                    rows.append(" ".join(parts))
+
+            with open(file_path, 'w', encoding='utf-8', newline='') as f:
+                if ext == ".csv":
+                    import csv
+                    writer = csv.writer(f)
+                    header = ["Word"]
+                    if include_phon: header.append("Phonetic")
+                    if include_trans: header.append("Translation")
+                    writer.writerow(header)
+                    writer.writerows(rows)
+                elif ext == ".md":
+                    f.write(f"# 单词导出: {source_label}\n\n")
+                    header = ["Word"]
+                    sep = ["---"]
+                    if include_phon: 
+                        header.append("Phonetic")
+                        sep.append("---")
+                    if include_trans: 
+                        header.append("Translation")
+                        sep.append("---")
+                    f.write("| " + " | ".join(header) + " |\n")
+                    f.write("| " + " | ".join(sep) + " |\n")
+                    f.write("\n".join(rows))
+                elif ext == ".json":
+                    import json as _json
+                    _json.dump(json_data, f, ensure_ascii=False, indent=2)
+                else:
+                    f.write("\n".join(rows))
+            QMessageBox.information(self, "导出成功", f"已成功从“{source_label}”导出 {len(words)} 个单词到：\n{file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"无法写入文件：{str(e)}")
