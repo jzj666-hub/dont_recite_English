@@ -2,8 +2,8 @@ import logging
 import os
 import sys
 
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QApplication, QMainWindow
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import QApplication, QMainWindow, QProgressDialog
 
 # ================= 路径自适应魔法开始 =================
 if getattr(sys, 'frozen', False):
@@ -51,23 +51,76 @@ class DictionaryApp(
     smart_favorite_ready = pyqtSignal(dict)
     inner_tool_result_ready = pyqtSignal(dict)
 
-    def __init__(self):
+    def __init__(self, startup_progress=None):
         super().__init__()
+        progress = startup_progress or (lambda *_: None)
+        progress(10, "正在连接信号...")
         self.ai_chunk_ready.connect(self._append_ai_chunk_to_note)
         self.ai_done.connect(self._finish_ai_generation)
         self.llm_result_ready.connect(self.on_llm_translate_result)
         self.ai_links_ready.connect(self.on_ai_links_result)
         self.smart_favorite_ready.connect(self.on_ai_smart_favorite_result)
         self.inner_tool_result_ready.connect(self.on_inner_tool_result)
+        progress(30, "正在初始化运行状态...")
         self.init_runtime_state()
+        progress(45, "正在加载词库...")
         self.init_database()
+        progress(60, "正在加载用户数据...")
         self.init_user_data()
+        progress(80, "正在构建界面...")
         self.init_ui()
+        progress(92, "正在加载离线翻译...")
         self.init_translator()
+        progress(100, "启动完成")
 
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = DictionaryApp()
+    startup = QProgressDialog("正在启动...", "", 0, 100)
+    startup.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+    startup.setWindowTitle("启动中")
+    startup.setWindowModality(Qt.WindowModality.ApplicationModal)
+    startup.setCancelButton(None)
+    startup.setMinimumDuration(0)
+    startup.setAutoClose(False)
+    startup.setAutoReset(False)
+    startup.resize(520, 132)
+    startup.setStyleSheet(
+        """
+        QProgressDialog {
+            background-color: #1f2430;
+            color: #e6edf3;
+            border: 1px solid #3b4252;
+            border-radius: 12px;
+            padding: 16px;
+            font-size: 14px;
+        }
+        QProgressBar {
+            background-color: #2b3240;
+            border: 1px solid #3b4252;
+            border-radius: 8px;
+            text-align: center;
+            color: #d8dee9;
+            min-height: 18px;
+        }
+        QProgressBar::chunk {
+            border-radius: 7px;
+            background-color: #5e81ac;
+            margin: 1px;
+        }
+        """
+    )
+    startup.show()
+    app.processEvents()
+
+    def on_startup_progress(value, message):
+        startup.setLabelText(message)
+        startup.setValue(max(0, min(100, int(value))))
+        app.processEvents()
+
+    on_startup_progress(5, "准备启动...")
+    window = DictionaryApp(startup_progress=on_startup_progress)
+    startup.setValue(100)
+    startup.close()
     window.show()
     sys.exit(app.exec())

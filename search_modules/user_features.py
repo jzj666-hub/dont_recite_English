@@ -3,19 +3,52 @@ import json
 import os
 import random
 import re
+import shutil
 import threading
 from datetime import datetime
 from urllib.parse import quote, unquote
 from urllib import error, request
 
-from PyQt6.QtCore import QTimer, Qt, QObject, pyqtSignal
+from PyQt6.QtCore import QEvent, QTimer, Qt, QObject, pyqtSignal
 
 class _AIImportSignalHelper(QObject):
     update_status = pyqtSignal(str)
     finish = pyqtSignal(bool, str, str)
     save_data = pyqtSignal(str, list)
-from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QTextDocument
+
+
+class _DocAnnotationSignalHelper(QObject):
+    chunk = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+
+class _DocEditOutsideClickFilter(QObject):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+
+    def eventFilter(self, obj, event):
+        owner = self.owner
+        if (
+            owner is not None
+            and event is not None
+            and event.type() == QEvent.Type.MouseButtonPress
+            and owner._is_doc_editing()
+            and hasattr(owner, "doc_content_edit")
+        ):
+            try:
+                global_pos = event.globalPosition().toPoint()
+                local_pos = owner.doc_content_edit.mapFromGlobal(global_pos)
+                if not owner.doc_content_edit.rect().contains(local_pos):
+                    owner.on_doc_mode_preview_clicked()
+            except Exception:
+                pass
+        return False
+
+
+from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QTextDocument, QTextCursor
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -32,6 +65,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QToolButton,
     QTextBrowser,
+    QTextEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
     QMenu,
@@ -45,6 +80,24 @@ from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_
 
 
 class UserFeaturesMixin:
+    def _install_doc_edit_outside_click_filter(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+        if getattr(self, "_doc_edit_outside_filter_installed", False):
+            return
+        self._doc_edit_outside_click_filter = _DocEditOutsideClickFilter(self)
+        app.installEventFilter(self._doc_edit_outside_click_filter)
+        self._doc_edit_outside_filter_installed = True
+
+    def _is_doc_editing(self):
+        if not hasattr(self, "doc_content_stack") or not hasattr(self, "doc_content_edit"):
+            return False
+        try:
+            return self.doc_content_stack.currentWidget() is self.doc_content_edit
+        except Exception:
+            return False
+
     def get_ai_prompts(self):
         raw = self.settings.get("ai_prompts_json", "") if hasattr(self, "settings") else ""
         merged = dict(default_ai_prompts())
@@ -1741,6 +1794,648 @@ class UserFeaturesMixin:
             self.import_ai_btn.setEnabled(True)
         if not success:
             QMessageBox.warning(self, "AI 智能解析", message)
+
+    def _normalize_doc_note_path(self, file_path):
+        return os.path.abspath(file_path or "").strip()
+
+    def _project_root_dir(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _get_doc_personal_dir(self):
+        target_dir = os.path.join(self._project_root_dir(), "personal_files", "markdown_docs")
+        os.makedirs(target_dir, exist_ok=True)
+        return target_dir
+
+    def _read_markdown_file(self, file_path):
+        with open(file_path, "r", encoding="utf-8", errors="strict") as f:
+            return f.read()
+
+    def refresh_doc_markdown_file_list(self):
+        if not hasattr(self, "doc_files_list"):
+            return
+        file_list = self.doc_files_list
+        file_list.blockSignals(True)
+        file_list.clear()
+        base_dir = self._get_doc_personal_dir()
+        entries = []
+        for root, _, files in os.walk(base_dir):
+            for name in files:
+                if not name.lower().endswith(".md"):
+                    continue
+                abs_path = self._normalize_doc_note_path(os.path.join(root, name))
+                rel_path = os.path.relpath(abs_path, base_dir)
+                entries.append((rel_path.replace("\\", "/"), abs_path))
+        entries.sort(key=lambda x: x[0].lower())
+        current_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        current_row = -1
+        for idx, (rel_path, abs_path) in enumerate(entries):
+            item = QListWidgetItem(rel_path)
+            item.setData(Qt.ItemDataRole.UserRole, abs_path)
+            item.setToolTip(abs_path)
+            file_list.addItem(item)
+            if current_path and abs_path.lower() == current_path.lower():
+                current_row = idx
+        if current_row >= 0:
+            file_list.setCurrentRow(current_row)
+        file_list.blockSignals(False)
+
+    def on_doc_file_item_activated(self, item):
+        if item is None:
+            return
+        file_path = item.data(Qt.ItemDataRole.UserRole)
+        if not file_path:
+            return
+        self.on_import_document_clicked(file_path)
+
+    def update_doc_markdown_preview(self):
+        if not hasattr(self, "doc_content_edit") or not hasattr(self, "doc_md_preview"):
+            return
+        md = self.doc_content_edit.toPlainText()
+        html_fragment = self.markdown_to_html_fragment(md)
+        self.doc_md_preview.setHtml(html_fragment)
+
+    def on_doc_mode_preview_clicked(self):
+        self.update_doc_markdown_preview()
+        if hasattr(self, "doc_content_stack") and hasattr(self, "doc_md_preview"):
+            self.doc_content_stack.setCurrentWidget(self.doc_md_preview)
+
+    def on_doc_mode_edit_clicked(self):
+        if hasattr(self, "doc_content_stack") and hasattr(self, "doc_content_edit"):
+            self.doc_content_stack.setCurrentWidget(self.doc_content_edit)
+            self.doc_content_edit.setFocus()
+
+    def on_doc_preview_mouse_press(self, event):
+        handler = getattr(self.doc_md_preview, "_orig_mouse_press", None) if hasattr(self, "doc_md_preview") else None
+        if handler is not None:
+            handler(event)
+
+    def on_doc_preview_double_click(self, event):
+        self.on_doc_mode_edit_clicked()
+        handler = getattr(self.doc_md_preview, "_orig_mouse_double_click", None) if hasattr(self, "doc_md_preview") else None
+        if handler is not None:
+            handler(event)
+
+    def on_doc_content_text_changed(self):
+        self.update_doc_markdown_preview()
+        self.apply_doc_annotation_highlights()
+
+    def on_doc_selection_changed(self):
+        if not hasattr(self, "doc_content_edit"):
+            return
+        cursor = self.doc_content_edit.textCursor()
+        selected = (cursor.selectedText() or "").replace("\u2029", "\n").strip()
+        if not selected:
+            self.doc_last_selected_text = ""
+            self.doc_last_selection_start = -1
+            self.doc_last_selection_end = -1
+            self.doc_auto_ai_last_signature = None
+            return
+        start_pos = min(cursor.selectionStart(), cursor.selectionEnd())
+        end_pos = max(cursor.selectionStart(), cursor.selectionEnd())
+        self.doc_last_selected_text = selected
+        self.doc_last_selection_start = start_pos
+        self.doc_last_selection_end = end_pos
+        self._queue_doc_auto_ai_annotation("edit", selected, start_pos, end_pos)
+
+    def on_doc_preview_selection_changed(self):
+        if not hasattr(self, "doc_md_preview"):
+            return
+        if hasattr(self, "doc_content_stack") and self.doc_content_stack.currentWidget() is not self.doc_md_preview:
+            return
+        cursor = self.doc_md_preview.textCursor()
+        selected = (cursor.selectedText() or "").replace("\u2029", "\n").strip()
+        if not selected:
+            self.doc_auto_ai_last_signature = None
+            return
+        self._queue_doc_auto_ai_annotation("preview", selected, -1, -1)
+
+    def _queue_doc_auto_ai_annotation(self, source, selected_text, start_pos, end_pos):
+        selected = (selected_text or "").strip()
+        if not selected:
+            return
+        signature = (
+            source,
+            self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", "")),
+            selected,
+            int(start_pos),
+            int(end_pos),
+        )
+        self.doc_auto_ai_pending = {
+            "source": source,
+            "selected": selected,
+            "start_pos": int(start_pos),
+            "end_pos": int(end_pos),
+            "signature": signature,
+        }
+        timer = getattr(self, "doc_auto_ai_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._fire_doc_auto_ai_annotation)
+            self.doc_auto_ai_timer = timer
+        timer.start(260)
+
+    def _resolve_doc_selection_range(self, selected_text):
+        if not hasattr(self, "doc_content_edit"):
+            return -1, -1
+        selected = (selected_text or "").strip()
+        if not selected:
+            return -1, -1
+        text = self.doc_content_edit.toPlainText()
+        if not text:
+            return -1, -1
+        idx = text.find(selected)
+        if idx < 0:
+            return -1, -1
+        return idx, idx + len(selected)
+
+    def _fire_doc_auto_ai_annotation(self):
+        pending = getattr(self, "doc_auto_ai_pending", None) or {}
+        if not pending:
+            return
+        if getattr(self, "doc_auto_ai_dialog_open", False):
+            return
+        signature = pending.get("signature")
+        if signature and signature == getattr(self, "doc_auto_ai_last_signature", None):
+            return
+        selected = (pending.get("selected") or "").strip()
+        if not selected:
+            return
+        start_pos = int(pending.get("start_pos", -1))
+        end_pos = int(pending.get("end_pos", -1))
+        if start_pos < 0 or end_pos <= start_pos:
+            start_pos, end_pos = self._resolve_doc_selection_range(selected)
+        if start_pos < 0 or end_pos <= start_pos:
+            return
+        self.doc_auto_ai_last_signature = signature
+        self.on_doc_ai_explain_clicked(
+            use_selection=True,
+            selected_override=selected,
+            start_pos_override=start_pos,
+            end_pos_override=end_pos,
+            silent_when_no_selection=True,
+        )
+
+    def on_doc_edit_focus_out(self, event):
+        QTextEdit.focusOutEvent(self.doc_content_edit, event)
+        if hasattr(self, "doc_content_stack") and hasattr(self, "doc_md_preview"):
+            self.on_doc_mode_preview_clicked()
+
+    def _highlight_text_brush_color(self):
+        if hasattr(self, "colors"):
+            return QColor(self.colors.get("highlight_bg", "#6b4f00"))
+        return QColor("#6b4f00")
+
+    def _doc_annotation_text_color(self):
+        if hasattr(self, "colors"):
+            return QColor(self.colors.get("highlight_text", "#ffe9a8"))
+        return QColor("#ffe9a8")
+
+    def _build_doc_annotation_cache(self, text):
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        cache = []
+        if not file_path:
+            return cache
+        if not text:
+            return cache
+        for row in self.get_doc_annotations(file_path):
+            start_pos = int(row.get("start_pos", -1))
+            end_pos = int(row.get("end_pos", -1))
+            selected_text = row.get("selected_text", "")
+            annotation = row.get("annotation", "")
+            if selected_text and start_pos >= 0 and end_pos > start_pos and end_pos <= len(text) and text[start_pos:end_pos] == selected_text:
+                resolved_start = start_pos
+                resolved_end = end_pos
+            else:
+                found_at = text.find(selected_text)
+                if found_at < 0:
+                    continue
+                resolved_start = found_at
+                resolved_end = found_at + len(selected_text)
+            cache.append(
+                {
+                    "start_pos": resolved_start,
+                    "end_pos": resolved_end,
+                    "selected_text": selected_text,
+                    "annotation": annotation,
+                }
+            )
+        return cache
+
+    def _build_doc_extra_selections(self, target_widget, rows):
+        out = []
+        for row in rows:
+            start_pos = int(row.get("start_pos", -1))
+            end_pos = int(row.get("end_pos", -1))
+            if start_pos < 0 or end_pos <= start_pos:
+                continue
+            cursor = target_widget.textCursor()
+            cursor.setPosition(start_pos)
+            cursor.setPosition(end_pos, QTextCursor.MoveMode.KeepAnchor)
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = cursor
+            sel.format.setUnderlineStyle(sel.format.UnderlineStyle.SingleUnderline)
+            sel.format.setUnderlineColor(self._highlight_text_brush_color())
+            bg = QColor(self._highlight_text_brush_color())
+            bg.setAlpha(110)
+            sel.format.setBackground(bg)
+            sel.format.setForeground(self._doc_annotation_text_color())
+            out.append(sel)
+        return out
+
+    def _get_doc_annotation_by_pos(self, pos):
+        for row in getattr(self, "doc_annotation_cache", []) or []:
+            start_pos = int(row.get("start_pos", -1))
+            end_pos = int(row.get("end_pos", -1))
+            if start_pos <= pos < end_pos:
+                return row
+        return None
+
+    def _show_doc_annotation_tooltip(self, global_pos, row):
+        if not row:
+            QToolTip.hideText()
+            self.doc_last_tooltip_key = None
+            return
+        key = (
+            int(row.get("start_pos", -1)),
+            int(row.get("end_pos", -1)),
+            (row.get("annotation", "") or "").strip(),
+        )
+        if key == getattr(self, "doc_last_tooltip_key", None):
+            return
+        selected = (row.get("selected_text", "") or "").strip()
+        annotation = (row.get("annotation", "") or "").strip()
+        if not annotation:
+            QToolTip.hideText()
+            self.doc_last_tooltip_key = None
+            return
+        preview_text = annotation if len(annotation) <= 280 else (annotation[:280] + "...")
+        text = f"【{selected or '注解片段'}】\n{preview_text}"
+        QToolTip.showText(global_pos, text, self)
+        self.doc_last_tooltip_key = key
+
+    def on_doc_edit_mouse_move(self, event):
+        handler = getattr(self.doc_content_edit, "_orig_mouse_move", None) if hasattr(self, "doc_content_edit") else None
+        if handler is not None:
+            handler(event)
+        if not hasattr(self, "doc_content_edit"):
+            return
+        cursor = self.doc_content_edit.cursorForPosition(event.pos())
+        pos = cursor.position()
+        row = self._get_doc_annotation_by_pos(pos)
+        self._show_doc_annotation_tooltip(self.doc_content_edit.mapToGlobal(event.pos()), row)
+
+    def on_doc_edit_leave(self, event):
+        handler = getattr(self.doc_content_edit, "_orig_leave_event", None) if hasattr(self, "doc_content_edit") else None
+        if handler is not None:
+            handler(event)
+        QToolTip.hideText()
+        self.doc_last_tooltip_key = None
+
+    def _get_doc_annotation_by_preview_word(self, word):
+        token = (word or "").strip().lower()
+        if not token:
+            return None
+        for row in getattr(self, "doc_annotation_cache", []) or []:
+            selected_text = (row.get("selected_text", "") or "").lower()
+            if token in selected_text:
+                return row
+        return None
+
+    def on_doc_preview_mouse_move(self, event):
+        handler = getattr(self.doc_md_preview, "_orig_mouse_move", None) if hasattr(self, "doc_md_preview") else None
+        if handler is not None:
+            handler(event)
+        if not hasattr(self, "doc_md_preview"):
+            return
+        cursor = self.doc_md_preview.cursorForPosition(event.pos())
+        row = None
+        pos = cursor.position()
+        for item in getattr(self, "doc_preview_annotation_cache", []) or []:
+            start_pos = int(item.get("start_pos", -1))
+            end_pos = int(item.get("end_pos", -1))
+            if start_pos <= pos < end_pos:
+                row = item
+                break
+        self._show_doc_annotation_tooltip(self.doc_md_preview.mapToGlobal(event.pos()), row)
+
+    def on_doc_preview_leave(self, event):
+        handler = getattr(self.doc_md_preview, "_orig_leave_event", None) if hasattr(self, "doc_md_preview") else None
+        if handler is not None:
+            handler(event)
+        QToolTip.hideText()
+        self.doc_last_tooltip_key = None
+
+    def get_doc_annotations(self, file_path):
+        if not file_path:
+            return []
+        cur = self.user_conn.cursor()
+        cur.execute(
+            "SELECT id, start_pos, end_pos, selected_text, annotation FROM doc_annotations "
+            "WHERE file_path = ? ORDER BY id DESC",
+            (file_path,),
+        )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": int(r[0]),
+                    "start_pos": int(r[1]),
+                    "end_pos": int(r[2]),
+                    "selected_text": r[3] or "",
+                    "annotation": r[4] or "",
+                }
+            )
+        return out
+
+    def apply_doc_annotation_highlights(self):
+        if not hasattr(self, "doc_content_edit"):
+            return
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        if not file_path:
+            self.doc_annotation_cache = []
+            self.doc_preview_annotation_cache = []
+            self.doc_content_edit.setExtraSelections([])
+            if hasattr(self, "doc_md_preview"):
+                self.doc_md_preview.setExtraSelections([])
+            return
+        edit_text = self.doc_content_edit.toPlainText()
+        self.doc_annotation_cache = self._build_doc_annotation_cache(edit_text)
+        self.doc_content_edit.setExtraSelections(self._build_doc_extra_selections(self.doc_content_edit, self.doc_annotation_cache))
+        if hasattr(self, "doc_md_preview"):
+            preview_text = self.doc_md_preview.toPlainText()
+            self.doc_preview_annotation_cache = self._build_doc_annotation_cache(preview_text)
+            self.doc_md_preview.setExtraSelections(self._build_doc_extra_selections(self.doc_md_preview, self.doc_preview_annotation_cache))
+
+    def on_import_document_clicked(self, file_path=None):
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择 Markdown 文档",
+                "",
+                "Markdown Files (*.md)",
+            )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".md"):
+            QMessageBox.warning(self, "导入文档失败", "析文仅支持 .md 文件。")
+            return
+        try:
+            src_abs = self._normalize_doc_note_path(file_path)
+            personal_dir = self._get_doc_personal_dir()
+            base_name = os.path.basename(src_abs)
+            target_path = os.path.join(personal_dir, base_name)
+            if os.path.abspath(src_abs).lower() != os.path.abspath(target_path).lower():
+                name, ext = os.path.splitext(base_name)
+                candidate = target_path
+                idx = 1
+                while os.path.exists(candidate):
+                    candidate = os.path.join(personal_dir, f"{name}_{idx}{ext}")
+                    idx += 1
+                shutil.copy2(src_abs, candidate)
+                target_path = candidate
+            text = self._read_markdown_file(target_path)
+        except Exception as e:
+            QMessageBox.warning(self, "导入文档失败", f"无法解析文档：{str(e)}")
+            return
+        if not text.strip():
+            QMessageBox.warning(self, "导入文档失败", "文档内容为空或不可读。")
+            return
+        normalized_path = self._normalize_doc_note_path(target_path)
+        self.current_doc_reader_path = normalized_path
+        self.current_doc_reader_text = text
+        if hasattr(self, "doc_current_path_label"):
+            self.doc_current_path_label.setText(f"当前文档：{normalized_path}")
+        if hasattr(self, "doc_content_edit"):
+            self.doc_content_edit.setPlainText(text)
+        self.update_doc_markdown_preview()
+        self.apply_doc_annotation_highlights()
+        self.refresh_doc_markdown_file_list()
+        self.on_doc_mode_preview_clicked()
+
+    def on_doc_content_context_menu(self, pos):
+        if not hasattr(self, "doc_content_edit"):
+            return
+        menu = self.doc_content_edit.createStandardContextMenu()
+        cursor = self.doc_content_edit.textCursor()
+        selected = (cursor.selectedText() or "").replace("\u2029", "\n").strip()
+        menu.addSeparator()
+        if selected:
+            action = menu.addAction("AI 划线注解选中片段")
+            action.triggered.connect(self.on_doc_ai_explain_clicked)
+        menu.exec(self.doc_content_edit.mapToGlobal(pos))
+        menu.deleteLater()
+
+    def on_doc_ai_explain_clicked(
+        self,
+        use_selection=True,
+        selected_override=None,
+        start_pos_override=None,
+        end_pos_override=None,
+        silent_when_no_selection=False,
+    ):
+        if not hasattr(self, "doc_content_edit"):
+            return
+        source_text = self.doc_content_edit.toPlainText().strip()
+        if not source_text:
+            QMessageBox.information(self, "提示", "请先导入文档。")
+            return
+        selected = (selected_override or "").replace("\u2029", "\n").strip()
+        if selected:
+            start_pos = int(start_pos_override if start_pos_override is not None else -1)
+            end_pos = int(end_pos_override if end_pos_override is not None else -1)
+            if start_pos < 0 or end_pos <= start_pos:
+                start_pos, end_pos = self._resolve_doc_selection_range(selected)
+        else:
+            tc = self.doc_content_edit.textCursor()
+            selected = (tc.selectedText() or "").replace("\u2029", "\n").strip()
+            if use_selection and not selected:
+                selected = (getattr(self, "doc_last_selected_text", "") or "").strip()
+                start_pos = int(getattr(self, "doc_last_selection_start", -1))
+                end_pos = int(getattr(self, "doc_last_selection_end", -1))
+            else:
+                start_pos = min(tc.selectionStart(), tc.selectionEnd())
+                end_pos = max(tc.selectionStart(), tc.selectionEnd())
+        if not (use_selection and selected and start_pos >= 0 and end_pos > start_pos):
+            if not silent_when_no_selection:
+                QMessageBox.information(self, "提示", "请先在 Markdown 编辑区选中要注解的片段。")
+            return
+        target_text = selected
+        source_kind = "划线片段"
+        url = self.normalize_api_url(self.settings.get("api_url", ""))
+        key = self.settings.get("api_key", "")
+        model = self.get_high_model_name() or self.get_mid_model_name()
+        if not url or not key or not model:
+            QMessageBox.warning(self, "AI 解读失败", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
+            return
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "doc_reader_explain_prompt",
+            (
+                "你是英语学习助手。请对用户圈选的文本给出可保存的划线注解。\n"
+                "要求：标题 + 3-5 条要点（词义/语法/语境/学习提示）。\n\n"
+                "待解读内容：\n{selected_text}"
+            ),
+        )
+        try:
+            prompt = (tmpl or "").format(source_kind=source_kind, selected_text=target_text)
+        except Exception:
+            prompt = (
+                "你是英语学习助手。请对用户提供的内容做清晰、可学习的解读，"
+                "先讲含义，再讲语境/搭配，最后给 1-2 条学习建议。\n\n"
+                f"待解读内容：\n{target_text}"
+            )
+        self.doc_auto_ai_dialog_open = True
+        try:
+            self._open_doc_annotation_dialog(url, key, model, prompt, target_text, start_pos, end_pos)
+        finally:
+            self.doc_auto_ai_dialog_open = False
+
+    def _open_doc_annotation_dialog(self, url, key, model, prompt, selected_text, start_pos, end_pos):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("AI 划线注解")
+        dlg.resize(620, 420)
+        root = QVBoxLayout()
+        tip = QLabel("AI 正在流式生成注解，确认后可直接保存为该片段的划线注解。")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+        output = QTextBrowser()
+        output.setOpenExternalLinks(False)
+        output.setPlaceholderText("等待模型响应...")
+        root.addWidget(output, 1)
+        btn_row = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        save_btn = QPushButton("保存这条注解")
+        save_btn.setEnabled(False)
+        btn_row.addButton(save_btn, QDialogButtonBox.ButtonRole.AcceptRole)
+        root.addWidget(btn_row)
+        dlg.setLayout(root)
+        helper = _DocAnnotationSignalHelper()
+        holder = {"answer": ""}
+
+        def on_chunk(piece):
+            if not piece:
+                return
+            holder["answer"] += piece
+            output.setPlainText(holder["answer"])
+            output.verticalScrollBar().setValue(output.verticalScrollBar().maximum())
+
+        def on_done(ok, err):
+            if not ok:
+                output.append(f"\n\n请求失败：{err}")
+                return
+            save_btn.setEnabled(True)
+
+        def on_save_clicked():
+            answer = (holder.get("answer") or "").strip()
+            if not answer:
+                QMessageBox.information(self, "提示", "当前没有可保存的注解内容。")
+                return
+            self.save_doc_annotation(start_pos, end_pos, selected_text, answer)
+            self.apply_doc_annotation_highlights()
+            QMessageBox.information(self, "保存成功", "划线注解已保存。")
+            dlg.accept()
+
+        helper.chunk.connect(on_chunk)
+        helper.done.connect(on_done)
+        save_btn.clicked.connect(on_save_clicked)
+        btn_row.rejected.connect(dlg.reject)
+        threading.Thread(
+            target=self._doc_reader_explain_worker_stream,
+            args=(url, key, model, prompt, helper),
+            daemon=True,
+        ).start()
+        dlg.exec()
+
+    def _doc_reader_explain_worker_stream(self, url, key, model, prompt, helper):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "note_ai_system", "You are a helpful English learning assistant for Chinese users.")},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "stream": True,
+        }
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = request.Request(
+                url,
+                data=data,
+                headers={
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {key}",
+                },
+                method="POST",
+            )
+            with request.urlopen(req, timeout=90) as resp:
+                content_type = (resp.headers.get("Content-Type", "") or "").lower()
+                if "text/event-stream" in content_type:
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_line = line[5:].strip()
+                        if not data_line:
+                            continue
+                        if data_line == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data_line)
+                        except Exception:
+                            continue
+                        choices = obj.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        piece = delta.get("content")
+                        if piece:
+                            helper.chunk.emit(piece)
+                else:
+                    resp_text = resp.read().decode("utf-8", errors="ignore")
+                    helper.chunk.emit(self.extract_text_from_response(resp_text) or "")
+            helper.done.emit(True, "")
+        except Exception as e:
+            helper.done.emit(False, str(e))
+
+    def save_doc_annotation(self, start_pos, end_pos, selected_text, annotation):
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        if not file_path:
+            return
+        token = (selected_text or "").strip()
+        note = (annotation or "").strip()
+        if not token or not note:
+            return
+        ts = datetime.now().isoformat(timespec="seconds")
+        cur = self.user_conn.cursor()
+        cur.execute(
+            "INSERT INTO doc_annotations(file_path, start_pos, end_pos, selected_text, annotation, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (file_path, int(start_pos), int(end_pos), token, note, ts, ts),
+        )
+        self.user_conn.commit()
+        session_title = f"析文注解 [{datetime.now().strftime('%m-%d %H:%M')}]"
+        session_content = f"【文件】{file_path}\n\n【划线片段】\n{token}\n\n【注解】\n{note}"
+        self.create_inner_session(session_title, "doc_reader", session_content, json.dumps({"file_path": file_path}, ensure_ascii=False))
+        self.load_inner_sessions()
+
+    def on_doc_save_markdown_clicked(self):
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        if not file_path:
+            QMessageBox.information(self, "提示", "请先导入 Markdown 文件。")
+            return
+        try:
+            text = self.doc_content_edit.toPlainText() if hasattr(self, "doc_content_edit") else ""
+            with open(file_path, "w", encoding="utf-8", errors="strict") as f:
+                f.write(text)
+            self.current_doc_reader_text = text
+            self.update_doc_markdown_preview()
+            self.apply_doc_annotation_highlights()
+            self.refresh_doc_markdown_file_list()
+            QMessageBox.information(self, "保存成功", f"Markdown 已保存到：\n{file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"无法保存 Markdown：{str(e)}")
 
 
     def safe_navigate_to_linked_word(self, target):

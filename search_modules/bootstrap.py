@@ -41,6 +41,8 @@ class BootstrapMixin:
         cur.execute("CREATE TABLE IF NOT EXISTS reviewing (query TEXT PRIMARY KEY, proficiency TEXT DEFAULT '人上人', created_at TEXT, last_visited_at TEXT)")
         cur.execute('CREATE TABLE IF NOT EXISTS word_links (id INTEGER PRIMARY KEY AUTOINCREMENT, word_a TEXT NOT NULL, word_b TEXT NOT NULL, created_at TEXT, UNIQUE(word_a, word_b))')
         cur.execute('CREATE TABLE IF NOT EXISTS inner_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, tool TEXT NOT NULL, content TEXT, config_json TEXT, rating INTEGER, created_at TEXT, updated_at TEXT)')
+        cur.execute('CREATE TABLE IF NOT EXISTS doc_notes (file_path TEXT PRIMARY KEY, title TEXT, content TEXT, source_text TEXT, updated_at TEXT)')
+        cur.execute('CREATE TABLE IF NOT EXISTS doc_annotations (id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT NOT NULL, start_pos INTEGER NOT NULL, end_pos INTEGER NOT NULL, selected_text TEXT NOT NULL, annotation TEXT NOT NULL, created_at TEXT, updated_at TEXT)')
         self.llm_cache_store = LLMCacheStore(self.user_conn)
         self.llm_cache_store.ensure_schema()
         self.migrate_reviewing_schema()

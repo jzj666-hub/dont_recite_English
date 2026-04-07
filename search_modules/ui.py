@@ -578,6 +578,110 @@ class UIMixin:
         export_layout.addWidget(export_desc)
         import_layout.addWidget(export_group)
 
+        # 第四态：析文（Markdown 导入 + 划线注解）
+        self.doc_page = QWidget()
+        self.main_tabs.addTab(self.doc_page, "析文")
+        doc_layout = QVBoxLayout()
+        doc_layout.setSpacing(12)
+        doc_layout.setContentsMargins(18, 18, 18, 18)
+        self.doc_page.setLayout(doc_layout)
+
+        doc_title = QLabel("🪶 析文 Exegesis")
+        doc_title.setFont(self.make_ui_font(24, True))
+        doc_title.setStyleSheet("color: #e5c07b;")
+        doc_layout.addWidget(doc_title)
+
+        doc_meta = QLabel("【析文】 披卷入微，循句采义；墨线所至，疑处可问，注解可存。")
+        doc_meta.setWordWrap(True)
+        doc_meta.setStyleSheet("color: #abb2bf; margin-bottom: 8px;")
+        doc_layout.addWidget(doc_meta)
+
+        doc_desc = QLabel("仅支持 Markdown（.md）。在预览或编辑区框选片段会自动弹出 AI 注解，确认后可保存为划线注解。")
+        doc_desc.setWordWrap(True)
+        doc_desc.setStyleSheet("color: #5c6370;")
+        doc_layout.addWidget(doc_desc)
+
+        doc_btn_row = QWidget()
+        doc_btn_layout = QHBoxLayout()
+        doc_btn_layout.setContentsMargins(0, 0, 0, 0)
+        doc_btn_row.setLayout(doc_btn_layout)
+        self.doc_import_btn = QPushButton("📁 导入 Markdown（.md）")
+        self.doc_import_btn.clicked.connect(self.on_import_document_clicked)
+        doc_btn_layout.addWidget(self.doc_import_btn)
+        self.doc_save_btn = QPushButton("💾 保存 Markdown")
+        self.doc_save_btn.clicked.connect(self.on_doc_save_markdown_clicked)
+        doc_btn_layout.addWidget(self.doc_save_btn)
+        doc_layout.addWidget(doc_btn_row)
+
+        self.doc_current_path_label = QLabel("当前文档：未导入")
+        self.doc_current_path_label.setWordWrap(True)
+        self.doc_current_path_label.setStyleSheet("color: #5c6370;")
+        doc_layout.addWidget(self.doc_current_path_label)
+
+        self.doc_content_host = QWidget()
+        self.doc_content_stack = QStackedLayout()
+        self.doc_content_stack.setContentsMargins(0, 0, 0, 0)
+        self.doc_content_host.setLayout(self.doc_content_stack)
+
+        self.doc_md_preview = QTextBrowser()
+        self.doc_md_preview.setOpenExternalLinks(False)
+        self.doc_md_preview.setPlaceholderText("Markdown 浏览模式")
+        self.doc_md_preview.setMouseTracking(True)
+        self.doc_md_preview.viewport().setMouseTracking(True)
+        self.doc_md_preview._orig_mouse_press = self.doc_md_preview.mousePressEvent
+        self.doc_md_preview._orig_mouse_double_click = self.doc_md_preview.mouseDoubleClickEvent
+        self.doc_md_preview._orig_mouse_move = self.doc_md_preview.mouseMoveEvent
+        self.doc_md_preview._orig_leave_event = self.doc_md_preview.leaveEvent
+        self.doc_md_preview.mousePressEvent = self.on_doc_preview_mouse_press
+        self.doc_md_preview.mouseDoubleClickEvent = self.on_doc_preview_double_click
+        self.doc_md_preview.mouseMoveEvent = self.on_doc_preview_mouse_move
+        self.doc_md_preview.leaveEvent = self.on_doc_preview_leave
+        self.doc_md_preview.selectionChanged.connect(self.on_doc_preview_selection_changed)
+        self.doc_content_stack.addWidget(self.doc_md_preview)
+
+        self.doc_content_edit = QTextEdit()
+        self.doc_content_edit.setReadOnly(False)
+        self.doc_content_edit.setPlaceholderText("Markdown 编辑区：仅支持 .md 文档。")
+        self.doc_content_edit.setMouseTracking(True)
+        self.doc_content_edit.viewport().setMouseTracking(True)
+        self.doc_content_edit._orig_mouse_move = self.doc_content_edit.mouseMoveEvent
+        self.doc_content_edit._orig_leave_event = self.doc_content_edit.leaveEvent
+        self.doc_content_edit.mouseMoveEvent = self.on_doc_edit_mouse_move
+        self.doc_content_edit.leaveEvent = self.on_doc_edit_leave
+        self.doc_content_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.doc_content_edit.customContextMenuRequested.connect(self.on_doc_content_context_menu)
+        self.doc_content_edit.textChanged.connect(self.on_doc_content_text_changed)
+        self.doc_content_edit.selectionChanged.connect(self.on_doc_selection_changed)
+        self.doc_content_edit.focusOutEvent = self.on_doc_edit_focus_out
+        self.doc_content_stack.addWidget(self.doc_content_edit)
+        self.doc_content_stack.setCurrentWidget(self.doc_md_preview)
+        if hasattr(self, "_install_doc_edit_outside_click_filter"):
+            self._install_doc_edit_outside_click_filter()
+        doc_main_row = QWidget()
+        doc_main_layout = QHBoxLayout()
+        doc_main_layout.setContentsMargins(0, 0, 0, 0)
+        doc_main_layout.setSpacing(12)
+        doc_main_row.setLayout(doc_main_layout)
+        doc_main_layout.addWidget(self.doc_content_host, 5)
+
+        doc_side_panel = QWidget()
+        doc_side_layout = QVBoxLayout()
+        doc_side_layout.setContentsMargins(0, 0, 0, 0)
+        doc_side_layout.setSpacing(8)
+        doc_side_panel.setLayout(doc_side_layout)
+        doc_files_title = QLabel("项目 Markdown")
+        doc_files_title.setFont(self.make_ui_font(11, True))
+        doc_side_layout.addWidget(doc_files_title)
+        self.doc_files_list = QListWidget()
+        self.doc_files_list.setMinimumWidth(220)
+        self.doc_files_list.itemActivated.connect(self.on_doc_file_item_activated)
+        self.doc_files_list.itemClicked.connect(self.on_doc_file_item_activated)
+        doc_side_layout.addWidget(self.doc_files_list, 1)
+        doc_main_layout.addWidget(doc_side_panel, 2)
+        doc_layout.addWidget(doc_main_row, 1)
+        if hasattr(self, "refresh_doc_markdown_file_list"):
+            self.refresh_doc_markdown_file_list()
+
         if hasattr(self, 'init_export_ui'):
             self.init_export_ui()
         inner_layout = QVBoxLayout()
@@ -753,7 +857,7 @@ class UIMixin:
         palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
         palette.setColor(QPalette.ColorRole.Base, QColor(45, 45, 45))
         palette.setColor(QPalette.ColorRole.AlternateBase, QColor(35, 35, 35))
-        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(255, 255, 255))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(45, 45, 45))
         palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
         palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
         palette.setColor(QPalette.ColorRole.Button, QColor(45, 45, 45))
@@ -897,6 +1001,12 @@ class UIMixin:
             )
         if hasattr(self, 'inner_dialog_editor'):
             self.inner_dialog_editor.setStyleSheet(input_style)
+        if hasattr(self, 'doc_md_preview'):
+            self.doc_md_preview.setStyleSheet(input_style)
+            self.doc_md_preview.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        if hasattr(self, 'doc_content_edit'):
+            self.doc_content_edit.setStyleSheet(input_style)
+            self.doc_content_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         if hasattr(self, 'ai_free_input'):
             self.ai_free_input.setStyleSheet(input_style)
         if hasattr(self, 'inner_tool_title'):
@@ -908,6 +1018,7 @@ class UIMixin:
             f"QMenu::item{{padding:6px 22px;}}"
             f"QMenu::item:selected{{background-color:{c['accent']};color:{c['accent_text']};}}"
             f"QMenu::separator{{height:1px;background:{c['border']};margin:4px 8px;}}"
+            f"QToolTip{{background-color:{c['widget_bg']};color:{c['text']};border:1px solid {c['border']};padding:6px;}}"
         )
         # 避免反复 apply_styles 导致样式无限追加
         existing = self.styleSheet() or ""
@@ -1085,7 +1196,8 @@ class UIMixin:
             "AI收藏夹推荐": ["smart_favorite_prompt"],
             "AI关联词推荐": ["suggest_links_prompt"],
             "LLM补充翻译": ["llm_translate_prompt"],
-            "随机考词": ["quiz_hint_prompt", "quiz_grade_prompt"]
+            "随机考词": ["quiz_hint_prompt", "quiz_grade_prompt"],
+            "文档解读": ["doc_reader_explain_prompt"],
         }
         
         # 创建每个分类的标签页
@@ -1400,7 +1512,8 @@ class UIMixin:
             "AI收藏夹推荐": "当使用AI智能推荐收藏夹功能时使用的提示词，控制AI如何根据当前词条选择合适的收藏夹。",
             "AI关联词推荐": "AI推荐相关单词功能使用的提示词，控制AI如何选择和推荐与当前单词相关的词汇。",
             "LLM补充翻译": "LLM翻译功能使用的提示词，控制AI如何生成详细的单词释义、例句和常见用法。",
-            "随机考词": "随机考词功能中使用的提示词，包括单词提示（轻/中/强提示）和最终评档的规则设置。"
+            "随机考词": "随机考词功能中使用的提示词，包括单词提示（轻/中/强提示）和最终评档的规则设置。",
+            "文档解读": "析文标签页中，针对框选 Markdown 片段进行 AI 划线注解（流式弹框输出）时使用的提示词。",
         }
         return descriptions.get(category_name, "该分类的详细说明。")
 
