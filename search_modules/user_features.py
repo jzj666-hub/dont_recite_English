@@ -35,6 +35,7 @@ class _DocEditOutsideClickFilter(QObject):
             and event.type() == QEvent.Type.MouseButtonPress
             and owner._is_doc_editing()
             and hasattr(owner, "doc_content_edit")
+            and not getattr(owner, "doc_auto_ai_dialog_open", False)
         ):
             try:
                 global_pos = event.globalPosition().toPoint()
@@ -411,15 +412,10 @@ class UserFeaturesMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.3,
-            "stream": False,
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(url, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"}, method="POST")
-            with request.urlopen(req, timeout=60) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                text = (self.extract_text_from_response(resp_text) or "").strip()
-                self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "hint", "word": word, "text": text})
+            text = (self.request_ai_stream_text(url, key, payload, timeout=60) or "").strip()
+            self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "hint", "word": word, "text": text})
         except Exception as e:
             self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "hint", "word": word, "error": str(e)})
 
@@ -457,15 +453,10 @@ class UserFeaturesMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2,
-            "stream": False,
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(url, data=data, headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"}, method="POST")
-            with request.urlopen(req, timeout=90) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                text = (self.extract_text_from_response(resp_text) or "").strip()
-                self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "grade", "text": text})
+            text = (self.request_ai_stream_text(url, key, payload, timeout=90) or "").strip()
+            self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "grade", "text": text})
         except Exception as e:
             self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "grade", "error": str(e)})
 
@@ -1087,43 +1078,33 @@ class UserFeaturesMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.5,
-            "stream": False,
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-                method="POST",
+            answer = (self.request_ai_stream_text(url, key, payload, timeout=90) or "").strip()
+            if not answer:
+                answer = "模型未返回内容。"
+            english_text = ""
+            chinese_text = ""
+            try:
+                obj = json.loads(answer)
+                if isinstance(obj, dict):
+                    english_text = str(obj.get("english", "")).strip()
+                    chinese_text = str(obj.get("chinese", "")).strip()
+            except Exception:
+                pass
+            if not english_text:
+                english_text = answer
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": True,
+                    "tool": "wordcraft",
+                    "stage": "generate",
+                    "english": english_text,
+                    "chinese": chinese_text,
+                    "words": words,
+                    "config": cfg,
+                }
             )
-            with request.urlopen(req, timeout=90) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                answer = (self.extract_text_from_response(resp_text) or "").strip()
-                if not answer:
-                    answer = "模型未返回内容。"
-                english_text = ""
-                chinese_text = ""
-                try:
-                    obj = json.loads(answer)
-                    if isinstance(obj, dict):
-                        english_text = str(obj.get("english", "")).strip()
-                        chinese_text = str(obj.get("chinese", "")).strip()
-                except Exception:
-                    pass
-                if not english_text:
-                    english_text = answer
-                self.inner_tool_result_ready.emit(
-                    {
-                        "ok": True,
-                        "tool": "wordcraft",
-                        "stage": "generate",
-                        "english": english_text,
-                        "chinese": chinese_text,
-                        "words": words,
-                        "config": cfg,
-                    }
-                )
         except error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8", errors="ignore")
@@ -1273,20 +1254,10 @@ class UserFeaturesMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.3,
-            "stream": False,
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
-                method="POST",
-            )
-            with request.urlopen(req, timeout=90) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                answer = (self.extract_text_from_response(resp_text) or "").strip()
-                self.inner_tool_result_ready.emit({"ok": True, "tool": "wordcraft", "stage": "explain", "answer": answer})
+            answer = (self.request_ai_stream_text(url, key, payload, timeout=90) or "").strip()
+            self.inner_tool_result_ready.emit({"ok": True, "tool": "wordcraft", "stage": "explain", "answer": answer})
         except error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8", errors="ignore")
@@ -1654,26 +1625,12 @@ class UserFeaturesMixin:
                 {"role": "user", "content": prompt}
             ]
             
-            print("[AI Import] [DEBUG] 正在导入 json/urllib")
-            import json as _json
-            from urllib import request as _req, error as _err
-            
             print("[AI Import] [DEBUG] 正在构造 Payload")
-            payload = {"model": model, "messages": messages, "temperature": 0.1, "stream": False}
-            data = _json.dumps(payload).encode("utf-8")
-            
-            print(f"[AI Import] [DEBUG] 准备向 URL 发送请求: {url}")
-            http_req = _req.Request(url, data=data, headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
-            }, method="POST")
+            payload = {"model": model, "messages": messages, "temperature": 0.1}
             
             helper.update_status.emit("⏳ [2/4] 正在等待 AI 响应（可能需要 10~30 秒）...")
-            print("[AI Import] [DEBUG] 正在执行 urlopen...")
-            with _req.urlopen(http_req, timeout=120) as resp:
-                print("[AI Import] [DEBUG] urlopen 成功响应")
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                answer = (self.extract_text_from_response(resp_text) or "").strip()
+            print("[AI Import] [DEBUG] 正在执行流式请求...")
+            answer = (self.request_ai_stream_text(url, key, payload, timeout=120) or "").strip()
             
             print(f"[AI Import] [DEBUG] AI 原始响应长度: {len(answer)}")
             if not answer:
@@ -1933,7 +1890,7 @@ class UserFeaturesMixin:
             timer.setSingleShot(True)
             timer.timeout.connect(self._fire_doc_auto_ai_annotation)
             self.doc_auto_ai_timer = timer
-        timer.start(260)
+        timer.start(520)
 
     def _resolve_doc_selection_range(self, selected_text):
         if not hasattr(self, "doc_content_edit"):
@@ -1949,11 +1906,48 @@ class UserFeaturesMixin:
             return -1, -1
         return idx, idx + len(selected)
 
+    def _build_doc_annotation_context(self, selected_text, start_pos, end_pos):
+        if not hasattr(self, "doc_content_edit"):
+            return (selected_text or "").strip()
+        full_text = self.doc_content_edit.toPlainText() or ""
+        token = (selected_text or "").strip()
+        if not full_text:
+            return token
+        try:
+            start = int(start_pos)
+            end = int(end_pos)
+        except Exception:
+            start, end = -1, -1
+        if start < 0 or end <= start:
+            start, end = self._resolve_doc_selection_range(token)
+        if start < 0 or end <= start:
+            return token
+        start = max(0, min(start, len(full_text)))
+        end = max(start + 1, min(end, len(full_text)))
+        window = 420
+        left = max(0, start - window)
+        right = min(len(full_text), end + window)
+        left_line = full_text.rfind("\n", 0, left)
+        if left_line >= 0:
+            left = left_line + 1
+        right_line = full_text.find("\n", right)
+        if right_line >= 0:
+            right = right_line
+        context = full_text[left:right].strip()
+        if not context:
+            context = token
+        return context
+
     def _fire_doc_auto_ai_annotation(self):
         pending = getattr(self, "doc_auto_ai_pending", None) or {}
         if not pending:
             return
         if getattr(self, "doc_auto_ai_dialog_open", False):
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            timer = getattr(self, "doc_auto_ai_timer", None)
+            if timer is not None:
+                timer.start(260)
             return
         signature = pending.get("signature")
         if signature and signature == getattr(self, "doc_auto_ai_last_signature", None):
@@ -1978,6 +1972,8 @@ class UserFeaturesMixin:
 
     def on_doc_edit_focus_out(self, event):
         QTextEdit.focusOutEvent(self.doc_content_edit, event)
+        if getattr(self, "doc_auto_ai_dialog_open", False):
+            return
         if hasattr(self, "doc_content_stack") and hasattr(self, "doc_md_preview"):
             self.on_doc_mode_preview_clicked()
 
@@ -2214,6 +2210,50 @@ class UserFeaturesMixin:
         self.refresh_doc_markdown_file_list()
         self.on_doc_mode_preview_clicked()
 
+    def on_doc_create_markdown_clicked(self):
+        base_dir = self._get_doc_personal_dir()
+        default_name = "untitled.md"
+        name, ok = QInputDialog.getText(self, "新建 Markdown", "请输入新文件名（.md）：", text=default_name)
+        if not ok:
+            return
+        file_name = (name or "").strip()
+        if not file_name:
+            QMessageBox.information(self, "提示", "文件名不能为空。")
+            return
+        if re.search(r'[<>:"/\\|?*]', file_name):
+            QMessageBox.warning(self, "新建失败", "文件名包含非法字符：<>:\"/\\|?*")
+            return
+        if not file_name.lower().endswith(".md"):
+            file_name += ".md"
+        target_path = self._normalize_doc_note_path(os.path.join(base_dir, file_name))
+        if os.path.exists(target_path):
+            overwrite = QMessageBox.question(
+                self,
+                "文件已存在",
+                f"文件已存在，是否覆盖？\n{target_path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if overwrite != QMessageBox.StandardButton.Yes:
+                return
+        template = f"# {os.path.splitext(file_name)[0]}\n\n"
+        try:
+            with open(target_path, "w", encoding="utf-8", errors="strict") as f:
+                f.write(template)
+        except Exception as e:
+            QMessageBox.warning(self, "新建失败", f"无法创建 Markdown：{str(e)}")
+            return
+        self.current_doc_reader_path = target_path
+        self.current_doc_reader_text = template
+        if hasattr(self, "doc_current_path_label"):
+            self.doc_current_path_label.setText(f"当前文档：{target_path}")
+        if hasattr(self, "doc_content_edit"):
+            self.doc_content_edit.setPlainText(template)
+        self.update_doc_markdown_preview()
+        self.apply_doc_annotation_highlights()
+        self.refresh_doc_markdown_file_list()
+        self.on_doc_mode_edit_clicked()
+
     def on_doc_content_context_menu(self, pos):
         if not hasattr(self, "doc_content_edit"):
             return
@@ -2263,6 +2303,8 @@ class UserFeaturesMixin:
             return
         target_text = selected
         source_kind = "划线片段"
+        context_text = self._build_doc_annotation_context(target_text, start_pos, end_pos)
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
         url = self.normalize_api_url(self.settings.get("api_url", ""))
         key = self.settings.get("api_key", "")
         model = self.get_high_model_name() or self.get_mid_model_name()
@@ -2275,15 +2317,24 @@ class UserFeaturesMixin:
             (
                 "你是英语学习助手。请对用户圈选的文本给出可保存的划线注解。\n"
                 "要求：标题 + 3-5 条要点（词义/语法/语境/学习提示）。\n\n"
+                "文档路径：\n{file_path}\n\n"
+                "待解读上下文：\n{source_context}\n\n"
                 "待解读内容：\n{selected_text}"
             ),
         )
         try:
-            prompt = (tmpl or "").format(source_kind=source_kind, selected_text=target_text)
+            prompt = (tmpl or "").format(
+                source_kind=source_kind,
+                selected_text=target_text,
+                source_context=context_text,
+                file_path=file_path or "未知",
+            )
         except Exception:
             prompt = (
                 "你是英语学习助手。请对用户提供的内容做清晰、可学习的解读，"
                 "先讲含义，再讲语境/搭配，最后给 1-2 条学习建议。\n\n"
+                f"文档路径：\n{file_path or '未知'}\n\n"
+                f"待解读上下文：\n{context_text}\n\n"
                 f"待解读内容：\n{target_text}"
             )
         self.doc_auto_ai_dialog_open = True

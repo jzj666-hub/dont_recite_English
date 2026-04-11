@@ -301,8 +301,17 @@ class UIMixin:
         mins = self.get_study_minutes_today()
         self.study_today_label.setText(f"🐣 今天已经学了 {mins} 分钟啦～")
 
+    def is_force_topmost_enabled(self):
+        return str(self.settings.get('force_topmost', '1')).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def apply_topmost_preference(self):
+        enabled = self.is_force_topmost_enabled()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        self.show()
+
     def init_ui(self):
         self.setWindowTitle('英语查词翻译软件')
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.is_force_topmost_enabled())
         self.setGeometry(100, 100, 900, 700)
         self.apply_theme()
         self.apply_font_preferences()
@@ -596,7 +605,7 @@ class UIMixin:
         doc_meta.setStyleSheet("color: #abb2bf; margin-bottom: 8px;")
         doc_layout.addWidget(doc_meta)
 
-        doc_desc = QLabel("仅支持 Markdown（.md）。在预览或编辑区框选片段会自动弹出 AI 注解，确认后可保存为划线注解。")
+        doc_desc = QLabel("仅支持 Markdown（.md）。完成框选后会自动弹出 AI 注解，注解会结合上下文生成，确认后可保存为划线注解。")
         doc_desc.setWordWrap(True)
         doc_desc.setStyleSheet("color: #5c6370;")
         doc_layout.addWidget(doc_desc)
@@ -605,6 +614,9 @@ class UIMixin:
         doc_btn_layout = QHBoxLayout()
         doc_btn_layout.setContentsMargins(0, 0, 0, 0)
         doc_btn_row.setLayout(doc_btn_layout)
+        self.doc_new_btn = QPushButton("📝 新建 Markdown（.md）")
+        self.doc_new_btn.clicked.connect(self.on_doc_create_markdown_clicked)
+        doc_btn_layout.addWidget(self.doc_new_btn)
         self.doc_import_btn = QPushButton("📁 导入 Markdown（.md）")
         self.doc_import_btn.clicked.connect(self.on_import_document_clicked)
         doc_btn_layout.addWidget(self.doc_import_btn)
@@ -1148,6 +1160,8 @@ class UIMixin:
         tts_rate_cn_slider, tts_rate_cn_container = create_rate_control('tts_rate_cn')
         font_english_edit = QComboBox()
         font_chinese_edit = QComboBox()
+        force_topmost_chk = QCheckBox("启用")
+        force_topmost_chk.setChecked(self.is_force_topmost_enabled())
         font_english_edit.setEditable(True)
         font_chinese_edit.setEditable(True)
         eng, zh = self.get_font_preferences()
@@ -1376,6 +1390,7 @@ class UIMixin:
         form.addRow("TTS 语速 (中文)", tts_rate_cn_container)
         form.addRow("英文字体", font_english_edit)
         form.addRow("中文字体", font_chinese_edit)
+        form.addRow("强制置顶本页面", force_topmost_chk)
         form.addRow("AI 提示词", ai_prompts_tabs)
         
         # 设置内容容器的布局
@@ -1418,6 +1433,7 @@ class UIMixin:
             zh_val = (font_chinese_edit.currentData() or font_chinese_edit.currentText() or "").strip()
             self.set_setting('font_english', eng_val or 'Segoe UI')
             self.set_setting('font_chinese', zh_val or 'Microsoft YaHei UI')
+            self.set_setting('force_topmost', '1' if force_topmost_chk.isChecked() else '0')
             
             # 处理AI提示词设置（从分类编辑框构建JSON）
             merged_prompts = {}
@@ -1445,6 +1461,7 @@ class UIMixin:
                 # 如果没有修改，保持原设置
                 pass
             self.load_settings()
+            self.apply_topmost_preference()
             self.apply_theme()
             self.apply_styles()
             # 立刻刷新当前界面字体（含那些创建时写死字体的控件，需要重绘/重建内容区）

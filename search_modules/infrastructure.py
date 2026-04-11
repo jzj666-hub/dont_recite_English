@@ -4,6 +4,7 @@ import math
 import re
 from collections import Counter
 from datetime import datetime
+from urllib import request
 
 
 def patch_argos_stanza_offline_mode():
@@ -145,6 +146,54 @@ class InfrastructureMixin:
         except Exception:
             pass
         return resp_text
+
+    def request_ai_stream_text(self, url, key, payload, timeout=60, on_chunk=None):
+        stream_payload = dict(payload or {})
+        stream_payload["stream"] = True
+        data = json.dumps(stream_payload).encode("utf-8")
+        req = request.Request(
+            url,
+            data=data,
+            headers={
+                "Accept": "text/event-stream",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+            method="POST",
+        )
+        text = ""
+        with request.urlopen(req, timeout=timeout) as resp:
+            content_type = (resp.headers.get("Content-Type", "") or "").lower()
+            if "text/event-stream" in content_type:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_line = line[5:].strip()
+                    if not data_line:
+                        continue
+                    if data_line == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data_line)
+                    except Exception:
+                        continue
+                    choices = obj.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    piece = delta.get("content")
+                    if not piece:
+                        continue
+                    text += piece
+                    if on_chunk:
+                        on_chunk(piece, text)
+            else:
+                resp_text = resp.read().decode("utf-8", errors="ignore")
+                text = (self.extract_text_from_response(resp_text) or "").strip()
+                if text and on_chunk:
+                    on_chunk(text, text)
+        return text
 
     def extract_words_from_ai_result(self, text):
         raw = (text or "").strip()

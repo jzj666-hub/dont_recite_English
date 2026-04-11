@@ -8,6 +8,7 @@ from search_modules.infrastructure import LLMCacheStore
 class BootstrapMixin:
     def init_runtime_state(self):
         self.llm_translate_click_count = 0
+        self.llm_translate_request_seq = 0
         self.llm_target_text = ""
         self.llm_target_is_word = False
         self.llm_restore_kind = ""
@@ -169,6 +170,9 @@ class BootstrapMixin:
         if 'tts_rate' not in self.settings:
             self.set_setting('tts_rate', '+0%')
             self.settings['tts_rate'] = '+0%'
+        if 'force_topmost' not in self.settings:
+            self.set_setting('force_topmost', '1')
+            self.settings['force_topmost'] = '1'
 
     def set_setting(self, key, value):
         cur = self.user_conn.cursor()

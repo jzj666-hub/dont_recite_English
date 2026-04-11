@@ -77,7 +77,11 @@ class DictionaryApp(
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     startup = QProgressDialog("正在启动...", "", 0, 100)
-    startup.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+    startup.setWindowFlags(
+        Qt.WindowType.Dialog
+        | Qt.WindowType.FramelessWindowHint
+        | Qt.WindowType.WindowStaysOnTopHint
+    )
     startup.setWindowTitle("启动中")
     startup.setWindowModality(Qt.WindowModality.ApplicationModal)
     startup.setCancelButton(None)

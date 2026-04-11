@@ -29,6 +29,7 @@ from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_
 
 class AIChatWindow(QDialog):
     chat_result_ready = pyqtSignal(dict)
+    chat_chunk_ready = pyqtSignal(str)
 
     def __init__(self, app, initial_prompt="", initial_payload="", title="AI 小助手"):
         super().__init__(app)
@@ -46,6 +47,8 @@ class AIChatWindow(QDialog):
         self.messages = [
             {"role": "system", "content": prompt_text(prompts, "chat_system", "你是英语学习助手。回答需要准确、清晰、结合上下文。")}
         ]
+        self.chat_blocks = []
+        self.pending_assistant_text = ""
         self.setWindowTitle(title)
         self.resize(780, 560)
         layout = QVBoxLayout()
@@ -77,6 +80,7 @@ class AIChatWindow(QDialog):
         layout.addLayout(input_row)
         self.setLayout(layout)
         self.chat_result_ready.connect(self.on_chat_result)
+        self.chat_chunk_ready.connect(self.on_chat_chunk)
         if initial_prompt:
             self.send_message(initial_prompt, payload_text=initial_payload or initial_prompt)
 
@@ -135,15 +139,32 @@ class AIChatWindow(QDialog):
         QDialog.mousePressEvent(self, event)
 
     def append_message(self, role, text):
-        if role == "user":
-            prefix = "你"
-            color = "#61dafb"
+        self.chat_blocks.append({"role": role, "text": text or ""})
+        self._render_chat_blocks()
+
+    def update_last_message(self, role, text):
+        if self.chat_blocks and self.chat_blocks[-1].get("role") == role:
+            self.chat_blocks[-1]["text"] = text or ""
         else:
-            prefix = "AI"
-            color = "#98c379"
-        body = self.markdown_to_html(text or "")
-        block = f"<div style='margin-bottom:10px;'><b style='color:{color};'>{prefix}</b><div style='margin-top:2px;white-space:pre-wrap;'>{body}</div></div>"
-        self.chat_view.append(block)
+            self.chat_blocks.append({"role": role, "text": text or ""})
+        self._render_chat_blocks()
+
+    def _render_chat_blocks(self):
+        blocks = []
+        for row in self.chat_blocks:
+            role = row.get("role", "")
+            text = row.get("text", "")
+            if role == "user":
+                prefix = "你"
+                color = "#61dafb"
+            else:
+                prefix = "AI"
+                color = "#98c379"
+            body = self.markdown_to_html(text or "")
+            blocks.append(
+                f"<div style='margin-bottom:10px;'><b style='color:{color};'>{prefix}</b><div style='margin-top:2px;white-space:pre-wrap;'>{body}</div></div>"
+            )
+        self.chat_view.setHtml("".join(blocks))
         self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
 
     def send_message(self, display_text, payload_text=""):
@@ -160,6 +181,8 @@ class AIChatWindow(QDialog):
         self.append_message("user", text)
         payload = (payload_text or text).strip()
         self.messages.append({"role": "user", "content": payload})
+        self.pending_assistant_text = ""
+        self.append_message("assistant", "")
         self.send_btn.setEnabled(False)
         snapshot = list(self.messages)
         threading.Thread(target=self._chat_worker, args=(url, key, model, snapshot), daemon=True).start()
@@ -173,20 +196,21 @@ class AIChatWindow(QDialog):
             "model": model,
             "messages": messages,
             "temperature": 0.2,
-            "stream": False
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(url, data=data, headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
-            }, method="POST")
-            with request.urlopen(req, timeout=60) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                answer = (self.app.extract_text_from_response(resp_text) or "").strip()
-                if not answer:
-                    answer = "模型未返回内容"
-                self.chat_result_ready.emit({"ok": True, "text": answer})
+            answer = (
+                self.app.request_ai_stream_text(
+                    url,
+                    key,
+                    payload,
+                    timeout=60,
+                    on_chunk=lambda piece, _full: self.chat_chunk_ready.emit(piece),
+                )
+                or ""
+            ).strip()
+            if not answer:
+                answer = "模型未返回内容"
+            self.chat_result_ready.emit({"ok": True, "text": answer})
         except error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8", errors="ignore")
@@ -196,9 +220,16 @@ class AIChatWindow(QDialog):
         except Exception as e:
             self.chat_result_ready.emit({"ok": False, "text": f"请求失败：{str(e)}"})
 
+    def on_chat_chunk(self, piece):
+        if not piece:
+            return
+        self.pending_assistant_text += piece
+        self.update_last_message("assistant", self.pending_assistant_text)
+
     def on_chat_result(self, result):
-        answer = (result or {}).get("text", "")
-        self.append_message("assistant", answer)
+        answer = (result or {}).get("text", "") or self.pending_assistant_text
+        self.pending_assistant_text = answer
+        self.update_last_message("assistant", answer)
         self.messages.append({"role": "assistant", "content": answer})
         self.send_btn.setEnabled(True)
         self.switch_input_to_edit()
@@ -349,19 +380,11 @@ class AIAssistantMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "stream": False
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(url, data=data, headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
-            }, method="POST")
-            with request.urlopen(req, timeout=60) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                text = (self.extract_text_from_response(resp_text) or "").strip()
-                names = self.extract_folder_names_from_ai_result(text, [name for _, name in folders])
-                self.smart_favorite_ready.emit({"ok": True, "query": query, "names": names})
+            text = (self.request_ai_stream_text(url, key, payload, timeout=60) or "").strip()
+            names = self.extract_folder_names_from_ai_result(text, [name for _, name in folders])
+            self.smart_favorite_ready.emit({"ok": True, "query": query, "names": names})
         except Exception as e:
             self.smart_favorite_ready.emit({"ok": False, "error": str(e), "query": query})
 
@@ -451,19 +474,11 @@ class AIAssistantMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2,
-            "stream": False
         }
         try:
-            data = json.dumps(payload).encode("utf-8")
-            req = request.Request(url, data=data, headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
-            }, method="POST")
-            with request.urlopen(req, timeout=60) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                text = (self.extract_text_from_response(resp_text) or "").strip()
-                words = self.extract_words_from_ai_result(text)
-                self.ai_links_ready.emit({"ok": True, "words": words, "current_word": current_word})
+            text = (self.request_ai_stream_text(url, key, payload, timeout=60) or "").strip()
+            words = self.extract_words_from_ai_result(text)
+            self.ai_links_ready.emit({"ok": True, "words": words, "current_word": current_word})
         except Exception as e:
             self.ai_links_ready.emit({"ok": False, "error": str(e), "current_word": current_word})
 
@@ -680,3 +695,6 @@ class AIAssistantMixin:
             self.ai_generate_btn.setEnabled(True)
         if hasattr(self, 'detail_tab_widget'):
             self.detail_tab_widget.setCurrentIndex(1)
+        # AI 流式输出完成后，强制回到批注预览，确保 Markdown 渲染可见。
+        if hasattr(self, 'switch_note_to_preview'):
+            self.switch_note_to_preview()

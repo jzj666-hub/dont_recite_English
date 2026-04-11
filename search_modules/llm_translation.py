@@ -92,10 +92,12 @@ class LLMTranslationMixin:
             model = high_model if high_model else mid_model
             model_level = "高级" if high_model else "中级"
         self.llm_translate_click_count += 1
+        self.llm_translate_request_seq = int(getattr(self, "llm_translate_request_seq", 0)) + 1
+        request_seq = self.llm_translate_request_seq
         loading_html = f"<div style='color:#98c379;'>正在使用{html.escape(model_level)}模型翻译...</div>"
         self.show_llm_translation_in_place(loading_html)
         prompt = self.build_llm_translate_prompt(self.llm_target_text, self.llm_target_is_word)
-        threading.Thread(target=self._llm_translate_worker, args=(url, key, model, model_level, prompt), daemon=True).start()
+        threading.Thread(target=self._llm_translate_worker, args=(url, key, model, model_level, prompt, request_seq), daemon=True).start()
 
     def build_llm_translate_prompt(self, text, is_word):
         meaning_rule = "字符串数组，按词性与语义分组，尽可能覆盖常见义项、引申义与高频短语义，至少 4 条。"
@@ -163,7 +165,7 @@ class LLMTranslationMixin:
         html_text = self.format_llm_translate_output(self.llm_last_response_text)
         self.show_llm_translation_in_place(html_text)
 
-    def _llm_translate_worker(self, url, key, model, model_level, prompt):
+    def _llm_translate_worker(self, url, key, model, model_level, prompt, request_seq):
         payload = {
             "model": model,
             "messages": [
@@ -171,33 +173,92 @@ class LLMTranslationMixin:
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.0,
-            "stream": False
+            "stream": True
         }
         try:
             data = json.dumps(payload).encode("utf-8")
             req = request.Request(url, data=data, headers={
+                "Accept": "text/event-stream",
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {key}"
             }, method="POST")
             with request.urlopen(req, timeout=60) as resp:
-                resp_text = resp.read().decode("utf-8", errors="ignore")
-                text = (self.extract_text_from_response(resp_text) or "").strip()
+                content_type = (resp.headers.get("Content-Type", "") or "").lower()
+                text = ""
+                if "text/event-stream" in content_type:
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_line = line[5:].strip()
+                        if not data_line:
+                            continue
+                        if data_line == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data_line)
+                        except Exception:
+                            continue
+                        choices = obj.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        piece = delta.get("content")
+                        if not piece:
+                            continue
+                        text += piece
+                        self.llm_result_ready.emit({
+                            "ok": True,
+                            "text": text,
+                            "level": model_level,
+                            "seq": request_seq,
+                            "streaming": True,
+                            "done": False,
+                        })
+                else:
+                    resp_text = resp.read().decode("utf-8", errors="ignore")
+                    text = (self.extract_text_from_response(resp_text) or "").strip()
                 if not text:
                     text = "模型未返回内容"
-                self.llm_result_ready.emit({"ok": True, "text": text, "level": model_level})
+                self.llm_result_ready.emit({
+                    "ok": True,
+                    "text": text,
+                    "level": model_level,
+                    "seq": request_seq,
+                    "streaming": False,
+                    "done": True,
+                })
         except error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8", errors="ignore")
             except Exception:
                 err_body = ""
-            self.llm_result_ready.emit({"ok": False, "text": f"请求失败：HTTP {e.code} {e.reason}\n{err_body}", "level": model_level})
+            self.llm_result_ready.emit({
+                "ok": False,
+                "text": f"请求失败：HTTP {e.code} {e.reason}\n{err_body}",
+                "level": model_level,
+                "seq": request_seq,
+                "streaming": False,
+                "done": True,
+            })
         except Exception as e:
-            self.llm_result_ready.emit({"ok": False, "text": f"请求失败：{str(e)}", "level": model_level})
+            self.llm_result_ready.emit({
+                "ok": False,
+                "text": f"请求失败：{str(e)}",
+                "level": model_level,
+                "seq": request_seq,
+                "streaming": False,
+                "done": True,
+            })
 
     def on_llm_translate_result(self, result):
+        current_seq = int(getattr(self, "llm_translate_request_seq", 0))
+        event_seq = int((result or {}).get("seq", current_seq))
+        if event_seq != current_seq:
+            return
         text = (result or {}).get("text", "")
         self.llm_last_response_text = text
         html_text = self.format_llm_translate_output(text)
         self.show_llm_translation_in_place(html_text)
-        if (result or {}).get("ok"):
+        if (result or {}).get("ok") and (result or {}).get("done", True):
             self.llm_cache_store.save_cached_html(self.llm_target_text, self.llm_restore_kind, html_text)
