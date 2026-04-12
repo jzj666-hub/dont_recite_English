@@ -1,4 +1,5 @@
 import html
+import concurrent.futures
 import json
 import os
 import random
@@ -50,6 +51,8 @@ class _DocEditOutsideClickFilter(QObject):
 from PyQt6.QtGui import QBrush, QColor, QCursor, QIcon, QPainter, QPen, QPixmap, QTextDocument, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -63,7 +66,9 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSpinBox,
+    QStackedWidget,
     QToolButton,
     QTextBrowser,
     QTextEdit,
@@ -215,19 +220,18 @@ class UserFeaturesMixin:
         # 随机考词
         self.inner_quiz_btn = QPushButton("随机考词")
         self.inner_quiz_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.inner_quiz_btn.setCheckable(True)
+        self.inner_quiz_btn.setIcon(self.build_quiz_icon())
         self.inner_quiz_btn.clicked.connect(self.on_inner_quiz_clicked)
+        self.inner_quiz_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.inner_quiz_btn.customContextMenuRequested.connect(self.on_quiz_button_context_menu)
         self.inner_tool_bar_layout.insertWidget(2, self.inner_quiz_btn)
         self.inner_tool_settings_btn = QPushButton("设置")
         self.inner_tool_settings_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.inner_tool_settings_btn.clicked.connect(self.open_wordcraft_settings_dialog)
+        self.inner_tool_settings_btn.clicked.connect(self.on_inner_tool_settings_clicked)
         self.inner_tool_settings_btn.setVisible(False)
-        self.inner_tool_bar_layout.insertWidget(3, self.inner_tool_settings_btn)
-        self.inner_wordcraft_listen_btn = QPushButton("🔊")
-        self.inner_wordcraft_listen_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.inner_wordcraft_listen_btn.setToolTip("朗读本会话英文")
-        self.inner_wordcraft_listen_btn.clicked.connect(self.on_wordcraft_listen_clicked)
-        self.inner_wordcraft_listen_btn.setVisible(False)
-        self.inner_tool_bar_layout.insertWidget(4, self.inner_wordcraft_listen_btn)
+        self.inner_tool_bar_layout.insertWidget(2, self.inner_tool_settings_btn)
+        self._sync_inner_tool_settings_position()
         self.inner_tool_action_1.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_2.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_1.clicked.connect(self.create_blank_inner_session)
@@ -252,6 +256,7 @@ class UserFeaturesMixin:
             self.inner_confirm_btn.clicked.connect(self.on_confirm_wordcraft_segments)
             self.inner_confirm_btn.setVisible(False)
         self.load_wordcraft_config()
+        self.load_quiz_config()
         self.load_inner_sessions()
         self.update_inner_toolbar_visual()
         self._init_quiz_panel()
@@ -261,47 +266,48 @@ class UserFeaturesMixin:
     def _init_quiz_panel(self):
         if not hasattr(self, "inner_quiz_panel") or self.inner_quiz_panel is None:
             return
-        # 防止重复初始化导致布局叠加（例如某些情况下重复调用 init_inner_workspace）
         if self.inner_quiz_panel.layout() is not None:
             return
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(10)
         self.inner_quiz_panel.setLayout(root)
-
-        title = QLabel("随机考词（最多 5 个）")
+        top_row = QHBoxLayout()
+        title = QLabel("随机考词（5 题，单题单页）")
         title.setFont(self.make_ui_font(12, True))
-        root.addWidget(title)
+        top_row.addWidget(title)
+        top_row.addStretch()
+        root.addLayout(top_row)
 
-        self.quiz_tip = QLabel("点击工具栏“随机考词”开始。每个单词可点“AI 提示”。完成后提交，让 AI 评档并自动更新熟练度。")
+        self.quiz_tip = QLabel("题型：1听写 2英语选中文 3语境猜义。右键“随机考词”或点“题型设置”可禁用题型并调语境难度。")
         self.quiz_tip.setWordWrap(True)
         root.addWidget(self.quiz_tip)
 
-        self.quiz_scroll = QScrollArea()
-        self.quiz_scroll.setWidgetResizable(True)
-        self.quiz_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
-        self.quiz_items_host = QWidget()
-        self.quiz_items_layout = QVBoxLayout()
-        self.quiz_items_layout.setContentsMargins(0, 0, 0, 0)
-        self.quiz_items_layout.setSpacing(10)
-        self.quiz_items_host.setLayout(self.quiz_items_layout)
-        self.quiz_scroll.setWidget(self.quiz_items_host)
-        root.addWidget(self.quiz_scroll, 1)
+        self.quiz_page_stack = QStackedWidget()
+        root.addWidget(self.quiz_page_stack, 1)
+        self.quiz_progress_label = QLabel("第 0 / 0 题")
+        root.addWidget(self.quiz_progress_label)
 
         btn_row = QWidget()
         btn_layout = QHBoxLayout()
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_row.setLayout(btn_layout)
+        self.quiz_prev_btn = QPushButton("上一题")
+        self.quiz_prev_btn.clicked.connect(lambda: self.go_quiz_page(-1))
+        btn_layout.addWidget(self.quiz_prev_btn)
+        self.quiz_next_btn = QPushButton("下一题")
+        self.quiz_next_btn.clicked.connect(lambda: self.go_quiz_page(1))
+        btn_layout.addWidget(self.quiz_next_btn)
         self.quiz_back_btn = QPushButton("返回会话")
         self.quiz_back_btn.clicked.connect(self._exit_quiz_panel)
         btn_layout.addWidget(self.quiz_back_btn)
         btn_layout.addStretch()
-        self.quiz_submit_btn = QPushButton("提交考核并评档")
+        self.quiz_submit_btn = QPushButton("提交考核")
         self.quiz_submit_btn.clicked.connect(self.on_quiz_submit_clicked)
         btn_layout.addWidget(self.quiz_submit_btn)
         root.addWidget(btn_row)
 
-        self.quiz_state = {"items": []}
+        self.quiz_state = {"items": [], "current_index": 0}
 
     def _enter_quiz_panel(self):
         if hasattr(self, "inner_dialog_stack"):
@@ -313,7 +319,6 @@ class UserFeaturesMixin:
 
     def get_quiz_candidates(self):
         cur = self.user_conn.cursor()
-        # 优先 reviewing，其次 favorites，最后 queries
         cur.execute("SELECT query FROM reviewing")
         rows = [r[0] for r in cur.fetchall() if (r and r[0])]
         if len(rows) < 5:
@@ -332,6 +337,263 @@ class UserFeaturesMixin:
             out.append(q.strip())
         return out
 
+    def build_quiz_icon(self):
+        pix = QPixmap(18, 18)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#f4d35e"), 2))
+        painter.drawRoundedRect(1, 1, 16, 16, 4, 4)
+        painter.setPen(QPen(QColor("#f4d35e"), 1))
+        painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "考")
+        painter.end()
+        return QIcon(pix)
+
+    def load_quiz_config(self):
+        raw = self.settings.get("quiz_config", "")
+        cfg = {}
+        if raw:
+            try:
+                cfg = json.loads(raw)
+            except Exception:
+                cfg = {}
+        enabled = cfg.get("enabled_types", [1, 2, 3])
+        normalized = []
+        for t in enabled:
+            try:
+                n = int(t)
+            except Exception:
+                continue
+            if n in (1, 2, 3) and n not in normalized:
+                normalized.append(n)
+        if not normalized:
+            normalized = [1, 2, 3]
+        difficulty = (cfg.get("context_difficulty", "CET-4") or "").strip()
+        if difficulty not in self.get_quiz_context_difficulty_options():
+            difficulty = "CET-4"
+        self.quiz_config = {
+            "enabled_types": normalized,
+            "context_difficulty": difficulty,
+        }
+
+    def save_quiz_config(self):
+        text = json.dumps(self.quiz_config, ensure_ascii=False)
+        self.set_setting("quiz_config", text)
+        self.settings["quiz_config"] = text
+
+    def get_quiz_context_difficulty_options(self):
+        return ["初中", "高中", "CET-4", "CET-6", "考研", "IELTS", "TOEFL", "GRE"]
+
+    def on_quiz_button_context_menu(self, pos):
+        menu = QMenu(self)
+        act = menu.addAction("题型设置")
+        act.triggered.connect(self.open_quiz_settings_dialog)
+        menu.exec(self.inner_quiz_btn.mapToGlobal(pos))
+
+    def on_inner_tool_settings_clicked(self):
+        if self.inner_active_tool == "wordcraft":
+            self.open_wordcraft_settings_dialog()
+            return
+        if self.inner_active_tool == "quiz":
+            self.open_quiz_settings_dialog()
+            return
+
+    def open_quiz_settings_dialog(self):
+        self.load_quiz_config()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("随机考词设置")
+        root = QVBoxLayout()
+        box = QGroupBox("禁出题型")
+        box_lay = QVBoxLayout()
+        cb1 = QCheckBox("题型1：给出听力和中文，拼写英文")
+        cb2 = QCheckBox("题型2：根据英文选择中文意思")
+        cb3 = QCheckBox("题型3：根据语境选择该词中文释义")
+        enabled = set(self.quiz_config.get("enabled_types", [1, 2, 3]))
+        cb1.setChecked(1 in enabled)
+        cb2.setChecked(2 in enabled)
+        cb3.setChecked(3 in enabled)
+        box_lay.addWidget(cb1)
+        box_lay.addWidget(cb2)
+        box_lay.addWidget(cb3)
+        box.setLayout(box_lay)
+        root.addWidget(box)
+        form = QFormLayout()
+        difficulty_combo = QComboBox()
+        for token in self.get_quiz_context_difficulty_options():
+            difficulty_combo.addItem(token)
+        for i in range(difficulty_combo.count()):
+            if difficulty_combo.itemText(i) == self.quiz_config.get("context_difficulty", "CET-4"):
+                difficulty_combo.setCurrentIndex(i)
+                break
+        form.addRow("语境题难度：", difficulty_combo)
+        root.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        root.addWidget(btns)
+        dlg.setLayout(root)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        enabled_types = []
+        if cb1.isChecked():
+            enabled_types.append(1)
+        if cb2.isChecked():
+            enabled_types.append(2)
+        if cb3.isChecked():
+            enabled_types.append(3)
+        if not enabled_types:
+            QMessageBox.warning(self, "设置未保存", "至少保留一种题型。")
+            return
+        self.quiz_config = {
+            "enabled_types": enabled_types,
+            "context_difficulty": difficulty_combo.currentText(),
+        }
+        self.save_quiz_config()
+
+    def get_word_translation(self, word):
+        token = (word or "").strip()
+        if not token:
+            return ""
+        self.cursor.execute("SELECT translation, detail, definition FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1", (token,))
+        row = self.cursor.fetchone()
+        parts = []
+        if row:
+            parts = [row[0] or "", row[1] or "", row[2] or ""]
+        text = " ".join([x.strip() for x in parts if x and x.strip()]).strip()
+        text = re.sub(r"\s+", " ", text)
+        return text[:180]
+
+    def pick_distractor_words(self, word, count=3):
+        token = (word or "").strip()
+        if not token:
+            return []
+        cands = []
+        if len(token) >= 3:
+            prefix = token[:3]
+            self.cursor.execute(
+                "SELECT word FROM stardict WHERE word LIKE ? COLLATE NOCASE AND word != ? LIMIT 60",
+                (f"{prefix}%", token),
+            )
+            cands.extend([r[0] for r in self.cursor.fetchall() if r and r[0]])
+        if len(cands) < count:
+            self.cursor.execute("SELECT query FROM reviewing WHERE query != ? COLLATE NOCASE ORDER BY RANDOM() LIMIT 80", (token,))
+            cands.extend([r[0] for r in self.cursor.fetchall() if r and r[0]])
+        out = []
+        seen = set([token.lower()])
+        for w in cands:
+            key = (w or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(w.strip())
+            if len(out) >= count:
+                break
+        return out
+
+    def build_quiz_question_locally(self, word, qtype):
+        translation = self.get_word_translation(word) or "（暂无释义）"
+        if qtype == 1:
+            return {
+                "type": 1,
+                "word": word,
+                "prompt": f"请听音并根据中文释义拼写英文：{translation}",
+                "answer": word,
+            }
+        distractor_words = self.pick_distractor_words(word, count=3)
+        choices = [{"text": translation, "correct": True}]
+        for dw in distractor_words:
+            dtrans = self.get_word_translation(dw) or f"{dw} 的释义"
+            choices.append({"text": dtrans, "correct": False, "source_word": dw})
+        random.shuffle(choices)
+        if qtype == 2:
+            return {
+                "type": 2,
+                "word": word,
+                "prompt": f"根据英文单词选择正确中文释义：{word}",
+                "choices": choices,
+            }
+        return {
+            "type": 3,
+            "word": word,
+            "context": f"In this sentence, the word '{word}' expresses a concrete meaning related to the situation.",
+            "prompt": f"根据英文语境选择“{word}”在句中的中文释义：\nIn this sentence, the word '{word}' expresses a concrete meaning related to the situation.",
+            "choices": choices,
+        }
+
+    def build_quiz_question_with_ai(self, word, qtype):
+        base = self.build_quiz_question_locally(word, qtype)
+        if qtype not in (2, 3):
+            return base
+        url = self.normalize_api_url(self.settings.get('api_url', ''))
+        key = self.settings.get('api_key', '')
+        model = self.get_mid_model_name() or self.get_high_model_name()
+        if not url or not key or not model:
+            return base
+        difficulty = self.quiz_config.get("context_difficulty", "CET-4")
+        distractors = [c.get("source_word", "") for c in base.get("choices", []) if not c.get("correct")]
+        prompt = (
+            "你是英语命题助手。输出严格 JSON，不要 markdown。\n"
+            f"单词: {word}\n"
+            f"题型: {qtype}\n"
+            f"语境难度: {difficulty}\n"
+            f"可用于干扰的形近词: {', '.join([d for d in distractors if d])}\n"
+            f"正确中文释义: {self.get_word_translation(word) or word}\n"
+            "要求：每次只出这一题，不要引用其它题内容。"
+            "如果是题型3，context 必须是英文语境句子；选项必须是中文释义。\n"
+            "返回格式："
+            "{\"question\":\"...\",\"context\":\"...\",\"choices\":[{\"text\":\"...\",\"is_correct\":true,\"source_word\":\"...\"}],\"answer_index\":1}"
+        )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "json_system", "You are a strict JSON generator.")},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
+        try:
+            raw = (self.request_ai_stream_text(url, key, payload, timeout=45) or "").strip()
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+                cleaned = re.sub(r"\s*```$", "", cleaned)
+            obj = json.loads(cleaned)
+            choices = obj.get("choices", [])
+            parsed = []
+            for c in choices:
+                text = (c.get("text", "") if isinstance(c, dict) else "").strip()
+                if not text:
+                    continue
+                parsed.append(
+                    {
+                        "text": text,
+                        "correct": bool(c.get("is_correct", False)),
+                        "source_word": (c.get("source_word", "") or "").strip(),
+                    }
+                )
+            if not parsed:
+                return base
+            if not any(c.get("correct") for c in parsed):
+                idx = int(obj.get("answer_index", 1) or 1) - 1
+                if 0 <= idx < len(parsed):
+                    parsed[idx]["correct"] = True
+            if not any(c.get("correct") for c in parsed):
+                parsed[0]["correct"] = True
+            base["choices"] = parsed
+            question = (obj.get("question", "") or "").strip()
+            if question:
+                base["prompt"] = question
+            if qtype == 3:
+                context = (obj.get("context", "") or "").strip()
+                if context:
+                    if re.search(r"[\u4e00-\u9fff]", context):
+                        context = base.get("context", context)
+                    base["context"] = context
+                    base["prompt"] = f"根据英文语境选择“{word}”在句中的中文释义：\n{context}"
+            return base
+        except Exception:
+            return base
+
     def get_word_profile(self, word):
         cur = self.user_conn.cursor()
         cur.execute("SELECT proficiency, last_visited_at FROM reviewing WHERE query = ? COLLATE NOCASE", (word,))
@@ -343,158 +605,193 @@ class UserFeaturesMixin:
         return proficiency, last_at
 
     def on_inner_quiz_clicked(self):
+        self.inner_active_tool = "quiz"
+        self.update_inner_toolbar_visual()
+        self.load_quiz_config()
         candidates = self.get_quiz_candidates()
         if not candidates:
             QMessageBox.information(self, "随机考词", "暂无可考核的单词（reviewing/favorites/queries 都为空）。")
             return
         picked = random.sample(candidates, k=min(5, len(candidates)))
-        self.build_quiz_items(picked)
+        enabled_types = list(self.quiz_config.get("enabled_types", [1, 2, 3]))
+        if not enabled_types:
+            QMessageBox.warning(self, "随机考词", "当前没有可用题型，请先到题型设置里开启。")
+            return
+        typed_words = []
+        for i, w in enumerate(picked):
+            typed_words.append((w, enabled_types[i % len(enabled_types)]))
+        random.shuffle(typed_words)
+        self.quiz_submit_btn.setEnabled(False)
+        self.set_inner_markdown_preview("随机考词题目生成中，请稍候...")
+        threading.Thread(target=self._quiz_build_worker, args=(typed_words,), daemon=True).start()
+
+    def _quiz_build_worker(self, typed_words):
+        try:
+            pairs = list(typed_words or [])
+            if not pairs:
+                self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "build", "error": "没有可用题目。"})
+                return
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(pairs))) as ex:
+                futures = [ex.submit(self.build_quiz_question_with_ai, w, t) for w, t in pairs]
+                questions = [f.result() for f in futures]
+            self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "build", "questions": questions})
+        except Exception as e:
+            self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "build", "error": str(e)})
+
+    def on_quiz_build_result(self, result):
+        if hasattr(self, "quiz_submit_btn") and self.quiz_submit_btn is not None:
+            self.quiz_submit_btn.setEnabled(True)
+        if not result or not result.get("ok"):
+            QMessageBox.warning(self, "随机考词", (result or {}).get("error", "题目生成失败"))
+            return
+        questions = result.get("questions", [])
+        if not isinstance(questions, list) or not questions:
+            QMessageBox.warning(self, "随机考词", "未生成有效题目。")
+            return
+        self.build_quiz_items(questions)
         self._enter_quiz_panel()
 
-    def build_quiz_items(self, words):
-        # 清空旧 items
-        for i in reversed(range(self.quiz_items_layout.count())):
-            w = self.quiz_items_layout.itemAt(i).widget()
-            if w is not None:
-                w.setParent(None)
+    def build_quiz_items(self, questions):
+        while self.quiz_page_stack.count() > 0:
+            page = self.quiz_page_stack.widget(0)
+            self.quiz_page_stack.removeWidget(page)
+            page.deleteLater()
         items = []
-        for w in words:
+        for idx, q in enumerate(questions):
+            w = q.get("word", "")
             p, last_at = self.get_word_profile(w)
             rel_time = self.format_relative_time(self.parse_iso_ts(last_at)) if last_at else "从未查询"
-            
-            # 使用 QGroupBox 包装每个词的考核项，增加层次感
-            box = QGroupBox(w)
+            page = QWidget()
+            page_wrap = QHBoxLayout()
+            page_wrap.setContentsMargins(0, 0, 0, 0)
+            page_wrap.addStretch()
+            box = QGroupBox(f"第 {idx + 1} 题 / 共 {len(questions)} 题")
+            box.setMinimumWidth(560)
+            box.setMaximumWidth(760)
             box.setFont(self.make_ui_font(12, True))
             lay = QVBoxLayout()
             lay.setContentsMargins(15, 20, 15, 15)
             lay.setSpacing(10)
             box.setLayout(lay)
-            
-            meta = QLabel(f"原熟练度：{p}    最近查询：{rel_time}")
+            page_wrap.addWidget(box)
+            page_wrap.addStretch()
+            page.setLayout(page_wrap)
+            meta = QLabel(f"单词：{w}    原熟练度：{p}    最近查询：{rel_time}")
             meta.setStyleSheet("color: #999; font-size: 11px; border: none;")
             lay.addWidget(meta)
 
-            ans = QPlainTextEdit()
-            ans.setPlaceholderText("请输入你对该词的中文释义/解释（越全面越好）")
-            ans.setFixedHeight(70)
-            ans.setStyleSheet("QPlainTextEdit{background: #252526; border: 1px solid #3e3e42; border-radius: 4px; padding: 6px; color: #d4d4d4;}")
-            lay.addWidget(ans)
-
-            hint_row = QWidget()
-            hint_lay = QHBoxLayout()
-            hint_lay.setContentsMargins(0, 0, 0, 0)
-            hint_row.setLayout(hint_lay)
-            hint_btn = QPushButton("💡 AI 提示")
-            hint_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            hint_btn.setStyleSheet("QPushButton{padding: 4px 12px;}")
-            hint_lay.addWidget(hint_btn)
-            hint_lay.addStretch()
-            lay.addWidget(hint_row)
-
-            hint_view = QTextBrowser()
-            hint_view.setOpenExternalLinks(False)
-            hint_view.setVisible(False)
-            hint_view.setMinimumHeight(72)
-            hint_view.setStyleSheet("QTextBrowser{border:1px solid #3d3d3d;border-radius:6px;padding:8px;color:#98c379;background: #1a1a1a;}")
-            lay.addWidget(hint_view)
-
+            qtype = int(q.get("type", 1))
+            prompt = QLabel(q.get("prompt", ""))
+            prompt.setWordWrap(True)
+            lay.addWidget(prompt)
+            answer_widget = None
+            answer_group = None
+            if qtype == 1:
+                play_btn = QPushButton("🔊 播放单词")
+                play_btn.clicked.connect(lambda _=False, token=w: self.play_quiz_word_audio(token))
+                lay.addWidget(play_btn)
+                ans = QLineEdit()
+                ans.setPlaceholderText("请输入英文拼写")
+                lay.addWidget(ans)
+                answer_widget = ans
+            else:
+                btn_group = QButtonGroup(self)
+                choices = q.get("choices", [])
+                for c_idx, choice in enumerate(choices):
+                    rb = QRadioButton(choice.get("text", ""))
+                    rb.setProperty("choice_index", c_idx)
+                    btn_group.addButton(rb, c_idx)
+                    lay.addWidget(rb)
+                answer_group = btn_group
             item = {
                 "word": w,
+                "type": qtype,
                 "before": p,
                 "last_at": last_at,
-                "answer_widget": ans,
-                "hint_used": False,
-                "hint_view": hint_view,
-                "hint_btn": hint_btn,
+                "question": q,
+                "answer_widget": answer_widget,
+                "answer_group": answer_group,
             }
-            hint_btn.clicked.connect(lambda _=False, it=item: self.on_quiz_hint_clicked(it))
             items.append(item)
-            self.quiz_items_layout.addWidget(box)
-        self.quiz_state = {"items": items}
+            self.quiz_page_stack.addWidget(page)
+        self.quiz_state = {"items": items, "current_index": 0}
+        self.update_quiz_page_view()
 
-    def on_quiz_hint_clicked(self, item):
-        word = item.get("word", "")
-        ans_text = item.get("answer_widget").toPlainText().strip() if item.get("answer_widget") else ""
-        url = self.normalize_api_url(self.settings.get('api_url', ''))
-        key = self.settings.get('api_key', '')
-        model = self.get_mid_model_name() or self.get_high_model_name()
-        if not url or not key or not model:
-            QMessageBox.warning(self, "AI 提示失败", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
+    def update_quiz_page_view(self):
+        items = self.quiz_state.get("items", [])
+        total = len(items)
+        idx = int(self.quiz_state.get("current_index", 0) or 0)
+        if total <= 0:
+            self.quiz_progress_label.setText("第 0 / 0 题")
+            self.quiz_prev_btn.setEnabled(False)
+            self.quiz_next_btn.setEnabled(False)
+            self.quiz_submit_btn.setEnabled(False)
             return
-        tmpl = prompt_text(self.get_ai_prompts(), "quiz_hint_prompt", "")
-        prompt = (tmpl or "").format(word=word, answer=ans_text)
-        item["hint_btn"].setEnabled(False)
-        threading.Thread(target=self._quiz_hint_worker, args=(url, key, model, prompt, word), daemon=True).start()
-        item["hint_used"] = True
+        idx = max(0, min(idx, total - 1))
+        self.quiz_state["current_index"] = idx
+        self.quiz_page_stack.setCurrentIndex(idx)
+        self.quiz_progress_label.setText(f"第 {idx + 1} / {total} 题")
+        self.quiz_prev_btn.setEnabled(idx > 0)
+        self.quiz_next_btn.setEnabled(idx < total - 1)
+        self.quiz_submit_btn.setEnabled(True)
 
-    def _quiz_hint_worker(self, url, key, model, prompt, word):
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "note_ai_system", "You are a helpful English learning assistant for Chinese users.")},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3,
-        }
-        try:
-            text = (self.request_ai_stream_text(url, key, payload, timeout=60) or "").strip()
-            self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "hint", "word": word, "text": text})
-        except Exception as e:
-            self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "hint", "word": word, "error": str(e)})
+    def go_quiz_page(self, delta):
+        if not self.quiz_state.get("items"):
+            return
+        self.quiz_state["current_index"] = int(self.quiz_state.get("current_index", 0)) + int(delta)
+        self.update_quiz_page_view()
+
+    def play_quiz_word_audio(self, word):
+        token = (word or "").strip()
+        if not token:
+            return
+        voice = self.settings.get("tts_voice", "en-US-GuyNeural")
+        rate = self.settings.get("tts_rate", "+0%")
+        get_tts_client().play(token, voice=voice, rate=rate)
+
+    def evaluate_quiz_item(self, item):
+        q = item.get("question", {}) or {}
+        qtype = int(item.get("type", 1) or 1)
+        if qtype == 1:
+            answer = (item.get("answer_widget").text() if item.get("answer_widget") else "").strip().lower()
+            correct = (q.get("answer", "") or "").strip().lower()
+            ok = bool(answer and answer == correct)
+            return answer, ok
+        group = item.get("answer_group")
+        checked_id = group.checkedId() if group is not None else -1
+        choices = q.get("choices", [])
+        picked = ""
+        ok = False
+        if 0 <= checked_id < len(choices):
+            picked = (choices[checked_id].get("text", "") or "").strip()
+            ok = bool(choices[checked_id].get("correct", False))
+        return picked, ok
 
     def on_quiz_submit_clicked(self):
         items = self.quiz_state.get("items", [])
         if not items:
             return
         payload_items = []
+        results = []
         for it in items:
-            ans = it["answer_widget"].toPlainText().strip()
+            ans, ok = self.evaluate_quiz_item(it)
+            before = (it.get("before") or "").strip() or "人上人"
+            shift = 1 if ok else -1
+            levels = self.get_proficiency_levels()
+            old_idx = self.get_proficiency_index(before)
+            new_idx = min(max(old_idx + shift, 0), len(levels) - 1)
+            final = levels[new_idx]
             payload_items.append({
                 "word": it["word"],
-                "before": it["before"],
-                "hint_used": bool(it.get("hint_used")),
+                "type": int(it.get("type", 1)),
+                "before": before,
                 "last_at": it.get("last_at", ""),
                 "answer": ans,
+                "correct": bool(ok),
             })
+            results.append({"word": it["word"], "before": before, "final": final, "correct": bool(ok)})
         self.quiz_state["user_answers"] = payload_items
-        url = self.normalize_api_url(self.settings.get('api_url', ''))
-        key = self.settings.get('api_key', '')
-        model = self.get_high_model_name() or self.get_mid_model_name()
-        if not url or not key or not model:
-            QMessageBox.warning(self, "评档失败", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
-            return
-        tmpl = prompt_text(self.get_ai_prompts(), "quiz_grade_prompt", "")
-        prompt = (tmpl or "").format(items_json=json.dumps(payload_items, ensure_ascii=False))
-        self.quiz_submit_btn.setEnabled(False)
-        threading.Thread(target=self._quiz_grade_worker, args=(url, key, model, prompt), daemon=True).start()
-
-    def _quiz_grade_worker(self, url, key, model, prompt):
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "json_system", "You are a strict JSON generator.")},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.2,
-        }
-        try:
-            text = (self.request_ai_stream_text(url, key, payload, timeout=90) or "").strip()
-            self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "grade", "text": text})
-        except Exception as e:
-            self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "grade", "error": str(e)})
-
-    def on_quiz_hint_result(self, result):
-        word = (result or {}).get("word", "")
-        ok = bool((result or {}).get("ok"))
-        text = (result or {}).get("text", "") if ok else f"提示失败：{(result or {}).get('error', '未知错误')}"
-        for it in self.quiz_state.get("items", []):
-            if (it.get("word") or "").lower() == (word or "").lower():
-                if it.get("hint_view") is not None:
-                    it["hint_view"].setVisible(True)
-                    it["hint_view"].setPlainText(text)
-                if it.get("hint_btn") is not None:
-                    it["hint_btn"].setEnabled(True)
-                break
+        self.on_quiz_grade_result({"ok": True, "tool": "quiz", "stage": "grade", "results": results})
 
     def apply_quiz_proficiency_updates(self, results):
         if not results:
@@ -525,38 +822,23 @@ class UserFeaturesMixin:
         if not result or not result.get("ok"):
             QMessageBox.warning(self, "评档失败", (result or {}).get("error", "未知错误"))
             return
-        raw = (result.get("text") or "").strip()
-        cleaned = raw
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s*```$", "", cleaned)
-        try:
-            obj = json.loads(cleaned)
-        except Exception:
-            QMessageBox.warning(self, "评档失败", "AI 返回内容不是合法 JSON。")
-            return
-        results = obj.get("results", [])
-        overall = obj.get("overall_comment", "")
-        final_lines = obj.get("final_lines", [])
+        results = result.get("results", [])
+        overall = ""
+        final_lines = []
         if not isinstance(results, list):
             results = []
         self.apply_quiz_proficiency_updates(results)
-
-        # 生成会话记录
         lines = []
         lines.append("【随机考词-评档结果】")
-        
-        # 添加用户的回答记录
         user_answers = self.quiz_state.get("user_answers", [])
         if user_answers:
             lines.append("\n【用户回答】")
             for ans in user_answers:
                 word = ans.get("word", "")
                 answer = ans.get("answer", "")
-                hint_used = "使用了提示" if ans.get("hint_used") else "未使用提示"
-                lines.append(f"{word}: {answer} ({hint_used})")
-        
-        # 添加AI评价
+                qtype = ans.get("type", 1)
+                ok = "正确" if ans.get("correct") else "错误"
+                lines.append(f"{word} [题型{qtype}]: {answer} ({ok})")
         if isinstance(final_lines, list) and final_lines:
             lines.append("\n【评档结果】")
             lines.append("\n".join([str(x) for x in final_lines if str(x).strip()]))
@@ -569,18 +851,13 @@ class UserFeaturesMixin:
             lines.append("\n【总体评价】")
             lines.append(str(overall))
         text = "\n".join([x for x in lines if x is not None])
-        
-        # 保存到会话历史
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         title = f"随机考词 [{ts}]"
         self.create_inner_session(title, "quiz", text, None)
         self.load_inner_sessions()
-        
-        # 选中新创建的会话
         if hasattr(self, 'inner_session_list') and self.inner_session_list.count() > 0:
             self.inner_session_list.setCurrentRow(0)
             self.on_inner_session_activated(self.inner_session_list.currentItem())
-        
         self._exit_quiz_panel()
 
 
@@ -597,14 +874,27 @@ class UserFeaturesMixin:
         return QIcon(pix)
 
     def update_inner_toolbar_visual(self):
-        if not hasattr(self, 'inner_wordcraft_btn'):
+        if not hasattr(self, 'inner_wordcraft_btn') or not hasattr(self, 'inner_quiz_btn'):
             return
-        active = self.inner_active_tool == "wordcraft"
-        self.inner_wordcraft_btn.setChecked(active)
-        self.inner_tool_settings_btn.setVisible(active)
-        if hasattr(self, "inner_wordcraft_listen_btn"):
-            self.inner_wordcraft_listen_btn.setVisible(active)
-            self.inner_wordcraft_listen_btn.setEnabled(bool((self.wordcraft_last_result or {}).get("english_clean", "").strip()))
+        active_wordcraft = self.inner_active_tool == "wordcraft"
+        active_quiz = self.inner_active_tool == "quiz"
+        self.inner_wordcraft_btn.setChecked(active_wordcraft)
+        self.inner_quiz_btn.setChecked(active_quiz)
+        self._sync_inner_tool_settings_position()
+        show_settings = active_wordcraft or active_quiz
+        self.inner_tool_settings_btn.setVisible(show_settings)
+        self.inner_tool_settings_btn.setText("设置")
+
+    def _sync_inner_tool_settings_position(self):
+        if not hasattr(self, "inner_tool_bar_layout") or not hasattr(self, "inner_tool_settings_btn"):
+            return
+        layout = self.inner_tool_bar_layout
+        anchor = self.inner_wordcraft_btn if self.inner_active_tool == "wordcraft" else self.inner_quiz_btn
+        anchor_idx = layout.indexOf(anchor)
+        if anchor_idx < 0:
+            return
+        layout.removeWidget(self.inner_tool_settings_btn)
+        layout.insertWidget(anchor_idx + 1, self.inner_tool_settings_btn)
 
     def load_wordcraft_config(self):
         raw = self.settings.get("wordcraft_config", "")
@@ -706,6 +996,7 @@ class UserFeaturesMixin:
             )
         return (
             "<div style='line-height:1.7;'>"
+            "<div style='display:inline-block;padding:4px 8px;border:1px solid #61dafb;border-radius:6px;color:#61dafb;margin-bottom:10px;'>🔊 点击朗读英文</div>"
             f"<div style='color:#61dafb;margin-bottom:8px;'>{tip}</div>"
             f"<div>{body}</div>"
             f"{chinese_block}"
@@ -744,7 +1035,7 @@ class UserFeaturesMixin:
         if self.inner_active_tool == "wordcraft" and event is not None and event.button() == Qt.MouseButton.LeftButton:
             cursor = self.inner_dialog_editor.cursorForPosition(event.pos())
             line_text = (cursor.block().text() or "").strip()
-            if line_text == "🔊":
+            if line_text.startswith("🔊"):
                 self.on_wordcraft_listen_clicked()
                 return
         if handler is not None:
@@ -1885,8 +2176,8 @@ class UserFeaturesMixin:
         tool = (result or {}).get("tool", "")
         if tool == "quiz":
             stage = (result or {}).get("stage", "")
-            if stage == "hint":
-                self.on_quiz_hint_result(result)
+            if stage == "build":
+                self.on_quiz_build_result(result)
                 return
             if stage == "grade":
                 self.on_quiz_grade_result(result)
@@ -2461,9 +2752,9 @@ class UserFeaturesMixin:
         # 确保 helper 跨线程可用
         if not hasattr(self, '_ai_import_signal_helper'):
             self._ai_import_signal_helper = _AIImportSignalHelper()
-            self._ai_import_signal_helper.update_status.connect(self._set_import_status_text)
-            self._ai_import_signal_helper.finish.connect(self._ai_import_finish)
-            self._ai_import_signal_helper.save_data.connect(self._ai_import_save)
+            self._ai_import_signal_helper.update_status.connect(self._set_import_status_text, Qt.ConnectionType.QueuedConnection)
+            self._ai_import_signal_helper.finish.connect(self._ai_import_finish, Qt.ConnectionType.QueuedConnection)
+            self._ai_import_signal_helper.save_data.connect(self._ai_import_save, Qt.ConnectionType.QueuedConnection)
             
         helper = self._ai_import_signal_helper
             
