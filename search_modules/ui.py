@@ -946,7 +946,7 @@ class UIMixin:
         
         # 通用输入框样式 - 应用到所有输入相关组件
         input_style = f"""
-            QLineEdit, QTextEdit, QTextBrowser, QComboBox {{
+            QLineEdit, QTextEdit, QTextBrowser, QPlainTextEdit, QComboBox, QAbstractSpinBox {{
                 background-color: {c['widget_bg']};
                 border: 2px solid {c['border']};
                 border-radius: 8px;
@@ -955,13 +955,13 @@ class UIMixin:
                 selection-background-color: {c['accent']};
                 selection-color: {c['accent_text']};
             }}
-            QLineEdit:focus, QTextEdit:focus, QTextBrowser:focus, QComboBox:focus {{
+            QLineEdit:focus, QTextEdit:focus, QTextBrowser:focus, QPlainTextEdit:focus, QComboBox:focus, QAbstractSpinBox:focus {{
                 border: 2px solid {c['accent']};
             }}
-            QLineEdit:hover, QTextEdit:hover, QTextBrowser:hover, QComboBox:hover {{
+            QLineEdit:hover, QTextEdit:hover, QTextBrowser:hover, QPlainTextEdit:hover, QComboBox:hover, QAbstractSpinBox:hover {{
                 border: 2px solid {c['accent']};
             }}
-            QLineEdit:disabled, QTextEdit:disabled, QTextBrowser:disabled, QComboBox:disabled {{
+            QLineEdit:disabled, QTextEdit:disabled, QTextBrowser:disabled, QPlainTextEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled {{
                 background-color: {c['bg_alt']};
                 color: {c['text_muted']};
             }}
@@ -1035,13 +1035,8 @@ class UIMixin:
             f"QMenu::separator{{height:1px;background:{c['border']};margin:4px 8px;}}"
             f"QToolTip{{background-color:{c['widget_bg']};color:{c['text']};border:1px solid {c['border']};padding:6px;}}"
         )
-        # 避免反复 apply_styles 导致样式无限追加
-        existing = self.styleSheet() or ""
-        if "QMenu{" in existing:
-            # 简单替换：若已存在菜单样式则不重复追加
-            pass
-        else:
-            self.setStyleSheet(existing + "\n" + menu_style)
+        # 统一挂到窗口级样式，覆盖动态创建的输入框（例如随机考词中的答题输入框）
+        self.setStyleSheet(input_style + "\n" + menu_style)
 
         self.apply_font_preferences()
         self.update_study_today_label()
