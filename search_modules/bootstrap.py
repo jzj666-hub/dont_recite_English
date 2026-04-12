@@ -44,9 +44,11 @@ class BootstrapMixin:
         cur.execute('CREATE TABLE IF NOT EXISTS inner_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, tool TEXT NOT NULL, content TEXT, config_json TEXT, rating INTEGER, created_at TEXT, updated_at TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS doc_notes (file_path TEXT PRIMARY KEY, title TEXT, content TEXT, source_text TEXT, updated_at TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS doc_annotations (id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT NOT NULL, start_pos INTEGER NOT NULL, end_pos INTEGER NOT NULL, selected_text TEXT NOT NULL, annotation TEXT NOT NULL, created_at TEXT, updated_at TEXT)')
+        cur.execute('CREATE TABLE IF NOT EXISTS wordcraft_annotations (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, start_pos INTEGER NOT NULL, end_pos INTEGER NOT NULL, selected_text TEXT NOT NULL, annotation TEXT NOT NULL, created_at TEXT, updated_at TEXT)')
         self.llm_cache_store = LLMCacheStore(self.user_conn)
         self.llm_cache_store.ensure_schema()
         self.migrate_reviewing_schema()
+        self.migrate_wordcraft_annotations_schema()
         self.user_conn.commit()
         cur.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)')
@@ -87,6 +89,70 @@ class BootstrapMixin:
                 cur.execute('INSERT OR IGNORE INTO favorites_new(query, folder_id, created_at) SELECT query, 1, NULL FROM favorites')
             cur.execute('DROP TABLE favorites')
             cur.execute('ALTER TABLE favorites_new RENAME TO favorites')
+
+    def migrate_wordcraft_annotations_schema(self):
+        cur = self.user_conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='wordcraft_annotations'")
+        if not cur.fetchone():
+            return
+        cur.execute('PRAGMA table_info(wordcraft_annotations)')
+        cols = [c[1] for c in cur.fetchall()]
+        required = {'session_id', 'start_pos', 'end_pos', 'selected_text', 'annotation', 'created_at', 'updated_at'}
+        if required.issubset(set(cols)):
+            return
+
+        if 'selected_text' in cols and 'segment_key' in cols:
+            selected_expr = 'COALESCE(selected_text, segment_key, "")'
+        elif 'selected_text' in cols:
+            selected_expr = 'COALESCE(selected_text, "")'
+        elif 'segment_key' in cols:
+            selected_expr = 'COALESCE(segment_key, "")'
+        else:
+            selected_expr = '""'
+
+        if 'annotation' in cols and 'explain_text' in cols:
+            annotation_expr = 'COALESCE(annotation, explain_text, "")'
+        elif 'annotation' in cols:
+            annotation_expr = 'COALESCE(annotation, "")'
+        elif 'explain_text' in cols:
+            annotation_expr = 'COALESCE(explain_text, "")'
+        else:
+            annotation_expr = '""'
+
+        start_expr = 'COALESCE(start_pos, -1)' if 'start_pos' in cols else '-1'
+        end_expr = 'COALESCE(end_pos, -1)' if 'end_pos' in cols else '-1'
+        if 'created_at' in cols and 'updated_at' in cols:
+            created_expr = 'COALESCE(created_at, updated_at, "")'
+            updated_expr = 'COALESCE(updated_at, created_at, "")'
+        elif 'created_at' in cols:
+            created_expr = 'COALESCE(created_at, "")'
+            updated_expr = 'COALESCE(created_at, "")'
+        elif 'updated_at' in cols:
+            created_expr = 'COALESCE(updated_at, "")'
+            updated_expr = 'COALESCE(updated_at, "")'
+        else:
+            created_expr = '""'
+            updated_expr = '""'
+
+        cur.execute('DROP TABLE IF EXISTS wordcraft_annotations_new')
+        cur.execute(
+            'CREATE TABLE wordcraft_annotations_new ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+            'session_id INTEGER NOT NULL, '
+            'start_pos INTEGER NOT NULL, '
+            'end_pos INTEGER NOT NULL, '
+            'selected_text TEXT NOT NULL, '
+            'annotation TEXT NOT NULL, '
+            'created_at TEXT, '
+            'updated_at TEXT)'
+        )
+        cur.execute(
+            'INSERT INTO wordcraft_annotations_new(session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at) '
+            f'SELECT COALESCE(session_id, 0), {start_expr}, {end_expr}, {selected_expr}, {annotation_expr}, {created_expr}, {updated_expr} '
+            'FROM wordcraft_annotations'
+        )
+        cur.execute('DROP TABLE wordcraft_annotations')
+        cur.execute('ALTER TABLE wordcraft_annotations_new RENAME TO wordcraft_annotations')
 
     def init_translator(self):
         self.translator = None

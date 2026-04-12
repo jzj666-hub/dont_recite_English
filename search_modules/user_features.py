@@ -9,7 +9,7 @@ from datetime import datetime
 from urllib.parse import quote, unquote
 from urllib import error, request
 
-from PyQt6.QtCore import QEvent, QTimer, Qt, QObject, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QTimer, Qt, QObject, pyqtSignal
 
 class _AIImportSignalHelper(QObject):
     update_status = pyqtSignal(str)
@@ -47,7 +47,7 @@ class _DocEditOutsideClickFilter(QObject):
         return False
 
 
-from PyQt6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QTextDocument, QTextCursor
+from PyQt6.QtGui import QBrush, QColor, QCursor, QIcon, QPainter, QPen, QPixmap, QTextDocument, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -78,6 +78,7 @@ from PyQt6.QtWidgets import (
 
 from search_modules.infrastructure import build_highlighted_text_html
 from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_text
+from search_modules.tts_client import get_tts_client
 
 
 class UserFeaturesMixin:
@@ -190,12 +191,20 @@ class UserFeaturesMixin:
         self.inner_active_tool = ""
         self.inner_current_session_id = None
         self.wordcraft_space_highlight_on = False
-        self.wordcraft_special_highlight_on = False
+        self.wordcraft_show_assist_on = False
         self.wordcraft_last_selected_text = ""
         self.wordcraft_last_result = {}
         self.wordcraft_pending_segments = []
         self.wordcraft_pending_confirm = False
         self.wordcraft_session_id = None
+        self.wordcraft_annotation_cache = []
+        self.wordcraft_auto_ai_last_signature = None
+        self.wordcraft_auto_ai_dialog_open = False
+        self.wordcraft_auto_ai_pending = None
+        self.wordcraft_auto_ai_inflight_signatures = set()
+        self.wordcraft_annotation_stream_buffers = {}
+        self.wordcraft_last_hover_key = None
+        self.wordcraft_annotation_hover_on_window = False
         self.inner_wordcraft_btn = QPushButton("选词成文")
         self.inner_wordcraft_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_wordcraft_btn.setCheckable(True)
@@ -213,17 +222,31 @@ class UserFeaturesMixin:
         self.inner_tool_settings_btn.clicked.connect(self.open_wordcraft_settings_dialog)
         self.inner_tool_settings_btn.setVisible(False)
         self.inner_tool_bar_layout.insertWidget(3, self.inner_tool_settings_btn)
+        self.inner_wordcraft_listen_btn = QPushButton("🔊")
+        self.inner_wordcraft_listen_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.inner_wordcraft_listen_btn.setToolTip("朗读本会话英文")
+        self.inner_wordcraft_listen_btn.clicked.connect(self.on_wordcraft_listen_clicked)
+        self.inner_wordcraft_listen_btn.setVisible(False)
+        self.inner_tool_bar_layout.insertWidget(4, self.inner_wordcraft_listen_btn)
         self.inner_tool_action_1.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_2.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_tool_action_1.clicked.connect(self.create_blank_inner_session)
         self.inner_tool_action_2.clicked.connect(self.delete_current_inner_session)
         self.inner_session_list.itemClicked.connect(self.on_inner_session_activated)
         self.inner_dialog_editor.setReadOnly(True)
+        self.inner_dialog_editor.setMouseTracking(True)
+        self.inner_dialog_editor.viewport().setMouseTracking(True)
         self.inner_dialog_editor.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.inner_dialog_editor.customContextMenuRequested.connect(self.on_inner_dialog_context_menu)
         self.inner_dialog_editor.selectionChanged.connect(self.on_inner_dialog_selection_changed)
         self.inner_dialog_editor._orig_key_press = self.inner_dialog_editor.keyPressEvent
+        self.inner_dialog_editor._orig_mouse_press = self.inner_dialog_editor.mousePressEvent
+        self.inner_dialog_editor._orig_mouse_move = self.inner_dialog_editor.mouseMoveEvent
+        self.inner_dialog_editor._orig_leave_event = self.inner_dialog_editor.leaveEvent
         self.inner_dialog_editor.keyPressEvent = self.on_inner_dialog_key_press
+        self.inner_dialog_editor.mousePressEvent = self.on_inner_dialog_mouse_press
+        self.inner_dialog_editor.mouseMoveEvent = self.on_inner_dialog_mouse_move
+        self.inner_dialog_editor.leaveEvent = self.on_inner_dialog_leave
         if hasattr(self, 'inner_confirm_btn'):
             self.inner_confirm_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             self.inner_confirm_btn.clicked.connect(self.on_confirm_wordcraft_segments)
@@ -579,6 +602,9 @@ class UserFeaturesMixin:
         active = self.inner_active_tool == "wordcraft"
         self.inner_wordcraft_btn.setChecked(active)
         self.inner_tool_settings_btn.setVisible(active)
+        if hasattr(self, "inner_wordcraft_listen_btn"):
+            self.inner_wordcraft_listen_btn.setVisible(active)
+            self.inner_wordcraft_listen_btn.setEnabled(bool((self.wordcraft_last_result or {}).get("english_clean", "").strip()))
 
     def load_wordcraft_config(self):
         raw = self.settings.get("wordcraft_config", "")
@@ -654,6 +680,7 @@ class UserFeaturesMixin:
     def render_wordcraft_english_html(self):
         english = self.wordcraft_last_result.get("english_clean", "")
         special_set = {w.lower() for w in self.wordcraft_last_result.get("special_words", [])}
+        chinese = self.wordcraft_last_result.get("chinese", "")
         if not english:
             return ""
         token_pattern = re.compile(r"[A-Za-z][A-Za-z'\-]*|[\s]+|[^\sA-Za-z]+")
@@ -663,15 +690,25 @@ class UserFeaturesMixin:
                 parts.append(html.escape(token))
                 continue
             low = token.lower()
-            if self.wordcraft_special_highlight_on and low in special_set:
+            if self.wordcraft_show_assist_on and low in special_set:
                 parts.append(f"<span style='background:#6b4f00;color:#ffe9a8;border-radius:3px;padding:1px 2px;'>{html.escape(token)}</span>")
             else:
                 parts.append(html.escape(token))
         body = "".join(parts).replace("\n", "<br>")
+        tip = "提示：按空格键可切换“中文+特殊词高亮”显示。"
+        chinese_block = ""
+        if self.wordcraft_show_assist_on and chinese:
+            chinese_block = (
+                "<div style='margin-top:12px;color:#98c379;'>"
+                "<div style='margin-bottom:4px;'>中文：</div>"
+                f"<div>{html.escape(chinese)}</div>"
+                "</div>"
+            )
         return (
             "<div style='line-height:1.7;'>"
-            "<div style='color:#61dafb;margin-bottom:8px;'>提示：按空格键可切换特殊词高亮；右键可把不懂片段加入讲解列表。</div>"
+            f"<div style='color:#61dafb;margin-bottom:8px;'>{tip}</div>"
             f"<div>{body}</div>"
+            f"{chinese_block}"
             "</div>"
         )
 
@@ -679,6 +716,7 @@ class UserFeaturesMixin:
         html_text = self.render_wordcraft_english_html()
         if html_text:
             self.inner_dialog_editor.setHtml(html_text)
+        self.apply_wordcraft_annotation_highlights()
 
     def markdown_to_html_fragment(self, text):
         doc = QTextDocument()
@@ -693,28 +731,728 @@ class UserFeaturesMixin:
         self.inner_dialog_editor.setHtml(self.markdown_to_html_fragment(text or ""))
 
     def on_inner_dialog_key_press(self, event):
-        if self.inner_active_tool == "wordcraft" and self.wordcraft_pending_confirm and event.key() == Qt.Key.Key_Space:
-            self.wordcraft_special_highlight_on = not self.wordcraft_special_highlight_on
+        if self.inner_active_tool == "wordcraft" and event.key() == Qt.Key.Key_Space and self.wordcraft_last_result.get("english_clean"):
+            self.wordcraft_show_assist_on = not self.wordcraft_show_assist_on
             self.refresh_wordcraft_display()
             return
         handler = getattr(self.inner_dialog_editor, "_orig_key_press", None)
         if handler is not None:
             handler(event)
 
+    def on_inner_dialog_mouse_press(self, event):
+        handler = getattr(self.inner_dialog_editor, "_orig_mouse_press", None) if hasattr(self, "inner_dialog_editor") else None
+        if self.inner_active_tool == "wordcraft" and event is not None and event.button() == Qt.MouseButton.LeftButton:
+            cursor = self.inner_dialog_editor.cursorForPosition(event.pos())
+            line_text = (cursor.block().text() or "").strip()
+            if line_text == "🔊":
+                self.on_wordcraft_listen_clicked()
+                return
+        if handler is not None:
+            handler(event)
+
     def on_inner_dialog_context_menu(self, pos):
         menu = self.inner_dialog_editor.createStandardContextMenu()
-        selected = (self.inner_dialog_editor.textCursor().selectedText() or "").replace("\u2029", "\n").strip()
-        if not selected:
-            selected = (self.wordcraft_last_selected_text or "").strip()
-        if selected:
-            action = menu.addAction("加入不懂片段")
-            action.triggered.connect(lambda: self.add_wordcraft_pending_segment(selected))
+        if self.inner_active_tool == "wordcraft":
+            menu.addSeparator()
+            tts_act = menu.addAction("🔊 朗读本会话英文")
+            tts_act.triggered.connect(self.on_wordcraft_listen_clicked)
+            selected = (self.inner_dialog_editor.textCursor().selectedText() or "").replace("\u2029", "\n").strip()
+            if selected:
+                act = menu.addAction("AI 注释选中片段")
+                act.triggered.connect(lambda: self.on_wordcraft_ai_annotate_selected(selected_text=selected, silent=False))
         menu.exec(self.inner_dialog_editor.mapToGlobal(pos))
 
     def on_inner_dialog_selection_changed(self):
         selected = (self.inner_dialog_editor.textCursor().selectedText() or "").replace("\u2029", "\n").strip()
         if selected:
             self.wordcraft_last_selected_text = selected
+        if self.inner_active_tool != "wordcraft":
+            return
+        session_id = self._active_wordcraft_session_id()
+        if session_id <= 0:
+            return
+        if not selected:
+            self.wordcraft_auto_ai_last_signature = None
+            return
+        cursor = self.inner_dialog_editor.textCursor()
+        start_pos = min(cursor.selectionStart(), cursor.selectionEnd())
+        end_pos = max(cursor.selectionStart(), cursor.selectionEnd())
+        self._queue_wordcraft_auto_ai_annotation(selected, start_pos, end_pos)
+
+    def _active_wordcraft_session_id(self):
+        if self.inner_active_tool != "wordcraft":
+            return 0
+        sid = self.inner_current_session_id or self.wordcraft_session_id
+        try:
+            sid = int(sid or 0)
+        except Exception:
+            sid = 0
+        return sid if sid > 0 else 0
+
+    def _queue_wordcraft_auto_ai_annotation(self, selected_text, start_pos, end_pos):
+        selected = (selected_text or "").strip()
+        if not selected:
+            return
+        session_id = self._active_wordcraft_session_id()
+        if session_id <= 0:
+            return
+        signature = (
+            "wordcraft",
+            int(session_id),
+            selected,
+            int(start_pos),
+            int(end_pos),
+        )
+        self.wordcraft_auto_ai_pending = {
+            "session_id": int(session_id),
+            "selected": selected,
+            "start_pos": int(start_pos),
+            "end_pos": int(end_pos),
+            "signature": signature,
+        }
+        timer = getattr(self, "wordcraft_auto_ai_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._fire_wordcraft_auto_ai_annotation)
+            self.wordcraft_auto_ai_timer = timer
+        timer.start(520)
+
+    def _fire_wordcraft_auto_ai_annotation(self):
+        pending = getattr(self, "wordcraft_auto_ai_pending", None) or {}
+        if not pending:
+            return
+        if getattr(self, "wordcraft_auto_ai_dialog_open", False):
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            timer = getattr(self, "wordcraft_auto_ai_timer", None)
+            if timer is not None:
+                timer.start(260)
+            return
+        signature = pending.get("signature")
+        if signature and signature == getattr(self, "wordcraft_auto_ai_last_signature", None):
+            return
+        selected = (pending.get("selected") or "").strip()
+        if not selected:
+            return
+        start_pos = int(pending.get("start_pos", -1))
+        end_pos = int(pending.get("end_pos", -1))
+        if start_pos < 0 or end_pos <= start_pos:
+            start_pos, end_pos = self._resolve_wordcraft_selection_range(selected)
+        self.wordcraft_auto_ai_last_signature = signature
+        self.on_wordcraft_ai_annotate_selected(
+            selected_text=selected,
+            start_pos=start_pos,
+            end_pos=end_pos,
+            silent=True,
+        )
+
+    def _resolve_wordcraft_selection_range(self, selected_text):
+        selected = (selected_text or "").strip()
+        if not selected or not hasattr(self, "inner_dialog_editor"):
+            return -1, -1
+        text = self.inner_dialog_editor.toPlainText() or ""
+        if not text:
+            return -1, -1
+        idx = text.find(selected)
+        if idx >= 0:
+            return idx, idx + len(selected)
+        return -1, -1
+
+    def _build_wordcraft_annotation_context(self, selected_text, start_pos, end_pos):
+        full_text = self.inner_dialog_editor.toPlainText() if hasattr(self, "inner_dialog_editor") else ""
+        token = (selected_text or "").strip()
+        if not full_text:
+            return token
+        try:
+            start = int(start_pos)
+            end = int(end_pos)
+        except Exception:
+            start, end = -1, -1
+        if start < 0 or end <= start:
+            start, end = self._resolve_wordcraft_selection_range(token)
+        if start < 0 or end <= start:
+            return token
+        start = max(0, min(start, len(full_text)))
+        end = max(start + 1, min(end, len(full_text)))
+        window = 420
+        left = max(0, start - window)
+        right = min(len(full_text), end + window)
+        context = full_text[left:right].strip()
+        return context or token
+
+    def on_wordcraft_ai_annotate_selected(self, selected_text, start_pos=-1, end_pos=-1, silent=False):
+        session_id = self._active_wordcraft_session_id()
+        selected = (selected_text or "").strip()
+        if session_id <= 0 or not selected:
+            return
+        url = self.normalize_api_url(self.settings.get("api_url", ""))
+        key = self.settings.get("api_key", "")
+        model = self.get_high_model_name() or self.get_mid_model_name()
+        if not url or not key or not model:
+            if not silent:
+                QMessageBox.warning(self, "AI 注释失败", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
+            return
+        context_text = self._build_wordcraft_annotation_context(selected, start_pos, end_pos)
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "doc_reader_explain_prompt",
+            (
+                "你是英语学习助手。请结合上下文解释用户圈选文本的含义。\n"
+                "输出纯文本，不要小标题、序号或 Markdown。\n\n"
+                "待解读上下文：\n{source_context}\n\n"
+                "待解读内容：\n{selected_text}"
+            ),
+        )
+        try:
+            prompt = (tmpl or "").format(
+                selected_text=selected,
+                source_context=context_text,
+                file_path=f"wordcraft_session:{session_id}",
+            )
+        except Exception:
+            prompt = (
+                "你是英语学习助手。请结合上下文解释用户选中片段在此处的意思。"
+                "输出纯文本，不要标题。\n\n"
+                f"上下文：\n{context_text}\n\n"
+                f"片段：\n{selected}"
+            )
+        signature = (
+            "wordcraft",
+            int(session_id),
+            int(start_pos),
+            int(end_pos),
+            selected,
+        )
+        inflight = getattr(self, "wordcraft_auto_ai_inflight_signatures", None)
+        if inflight is None:
+            inflight = set()
+            self.wordcraft_auto_ai_inflight_signatures = inflight
+        if signature in inflight:
+            return
+        inflight.add(signature)
+        self.wordcraft_auto_ai_dialog_open = True
+        self._begin_wordcraft_annotation_stream(signature, selected, start_pos, end_pos)
+        threading.Thread(
+            target=self._wordcraft_annotation_worker_stream,
+            args=(url, key, model, prompt, session_id, selected, start_pos, end_pos, signature, bool(silent)),
+            daemon=True,
+        ).start()
+
+    def _begin_wordcraft_annotation_stream(self, signature, selected_text, start_pos, end_pos):
+        buffers = getattr(self, "wordcraft_annotation_stream_buffers", None)
+        if buffers is None:
+            buffers = {}
+            self.wordcraft_annotation_stream_buffers = buffers
+        buffers[signature] = ""
+        anchor = {
+            "session_id": self._active_wordcraft_session_id(),
+            "start_pos": int(start_pos),
+            "end_pos": int(end_pos),
+            "selected_text": (selected_text or "").strip(),
+        }
+        self.open_wordcraft_annotation_window(row=anchor)
+        if hasattr(self, "wordcraft_annotation_window_detail"):
+            self.wordcraft_annotation_window_detail.setPlainText("AI 正在生成注释...\n")
+
+    def _wordcraft_annotation_worker_stream(self, url, key, model, prompt, session_id, selected_text, start_pos, end_pos, signature, silent):
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "note_ai_system", "You are a helpful English learning assistant for Chinese users.")},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "stream": True,
+        }
+        pieces = []
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            req = request.Request(
+                url,
+                data=data,
+                headers={
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {key}",
+                },
+                method="POST",
+            )
+            with request.urlopen(req, timeout=90) as resp:
+                content_type = (resp.headers.get("Content-Type", "") or "").lower()
+                if "text/event-stream" in content_type:
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data_line = line[5:].strip()
+                        if not data_line:
+                            continue
+                        if data_line == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(data_line)
+                        except Exception:
+                            continue
+                        choices = obj.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
+                        piece = delta.get("content")
+                        if not piece:
+                            continue
+                        pieces.append(piece)
+                        self.inner_tool_result_ready.emit(
+                            {
+                                "ok": True,
+                                "tool": "wordcraft_annotation",
+                                "stage": "chunk",
+                                "signature": signature,
+                                "session_id": int(session_id),
+                                "selected_text": selected_text,
+                                "start_pos": int(start_pos),
+                                "end_pos": int(end_pos),
+                                "silent": bool(silent),
+                                "piece": piece,
+                            }
+                        )
+                else:
+                    resp_text = resp.read().decode("utf-8", errors="ignore")
+                    text_piece = self.extract_text_from_response(resp_text) or ""
+                    if text_piece:
+                        pieces.append(text_piece)
+                        self.inner_tool_result_ready.emit(
+                            {
+                                "ok": True,
+                                "tool": "wordcraft_annotation",
+                                "stage": "chunk",
+                                "signature": signature,
+                                "session_id": int(session_id),
+                                "selected_text": selected_text,
+                                "start_pos": int(start_pos),
+                                "end_pos": int(end_pos),
+                                "silent": bool(silent),
+                                "piece": text_piece,
+                            }
+                        )
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": True,
+                    "tool": "wordcraft_annotation",
+                    "stage": "done",
+                    "signature": signature,
+                    "session_id": int(session_id),
+                    "selected_text": selected_text,
+                    "start_pos": int(start_pos),
+                    "end_pos": int(end_pos),
+                    "silent": bool(silent),
+                    "text": "".join(pieces).strip(),
+                }
+            )
+        except Exception as e:
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": False,
+                    "tool": "wordcraft_annotation",
+                    "stage": "done",
+                    "signature": signature,
+                    "session_id": int(session_id),
+                    "selected_text": selected_text,
+                    "start_pos": int(start_pos),
+                    "end_pos": int(end_pos),
+                    "silent": bool(silent),
+                    "error": str(e),
+                }
+            )
+
+    def on_wordcraft_annotation_result(self, result):
+        stage = (result or {}).get("stage", "done")
+        signature = (result or {}).get("signature")
+        if stage == "chunk":
+            piece = (result or {}).get("piece", "")
+            if not piece:
+                return
+            buffers = getattr(self, "wordcraft_annotation_stream_buffers", None)
+            if buffers is None:
+                buffers = {}
+                self.wordcraft_annotation_stream_buffers = buffers
+            buffers[signature] = (buffers.get(signature, "") or "") + piece
+            if hasattr(self, "wordcraft_annotation_window_detail"):
+                self.wordcraft_annotation_window_detail.setPlainText(buffers[signature])
+            return
+        inflight = getattr(self, "wordcraft_auto_ai_inflight_signatures", None)
+        if isinstance(inflight, set) and signature in inflight:
+            inflight.discard(signature)
+        self.wordcraft_auto_ai_dialog_open = False
+        if not result or not result.get("ok"):
+            if not (result or {}).get("silent"):
+                QMessageBox.warning(self, "AI 注释失败", (result or {}).get("error", "未知错误"))
+            return
+        buffers = getattr(self, "wordcraft_annotation_stream_buffers", None)
+        streamed = ""
+        if isinstance(buffers, dict):
+            streamed = buffers.pop(signature, "")
+        note = (streamed or (result or {}).get("text", "") or "").strip()
+        if note.startswith("```"):
+            note = re.sub(r"^```(?:text|markdown)?\s*", "", note, flags=re.IGNORECASE)
+            note = re.sub(r"\s*```$", "", note)
+            note = note.strip()
+        if not note:
+            if not (result or {}).get("silent"):
+                QMessageBox.information(self, "AI 注释", "模型未返回有效注释内容。")
+            return
+        row = self.save_wordcraft_annotation(
+            int((result or {}).get("session_id", 0)),
+            int((result or {}).get("start_pos", -1)),
+            int((result or {}).get("end_pos", -1)),
+            (result or {}).get("selected_text", ""),
+            note,
+        )
+        if not row:
+            return
+        self.apply_wordcraft_annotation_highlights()
+        self.open_wordcraft_annotation_window(row=row)
+
+    def save_wordcraft_annotation(self, session_id, start_pos, end_pos, selected_text, annotation):
+        sid = int(session_id or 0)
+        token = (selected_text or "").strip()
+        note = (annotation or "").strip()
+        if sid <= 0 or not token or not note:
+            return None
+        s_pos = int(start_pos)
+        e_pos = int(end_pos)
+        if s_pos < 0 or e_pos <= s_pos:
+            s_pos, e_pos = self._resolve_wordcraft_selection_range(token)
+        if s_pos < 0 or e_pos <= s_pos:
+            s_pos, e_pos = 0, 0
+        ts = datetime.now().isoformat(timespec="seconds")
+        cur = self.user_conn.cursor()
+        cur.execute(
+            "INSERT INTO wordcraft_annotations(session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (sid, int(s_pos), int(e_pos), token, note, ts, ts),
+        )
+        ann_id = int(cur.lastrowid)
+        self.user_conn.commit()
+        return {
+            "id": ann_id,
+            "session_id": sid,
+            "start_pos": int(s_pos),
+            "end_pos": int(e_pos),
+            "selected_text": token,
+            "annotation": note,
+            "created_at": ts,
+            "updated_at": ts,
+        }
+
+    def get_wordcraft_annotations(self, session_id):
+        sid = int(session_id or 0)
+        if sid <= 0:
+            return []
+        cur = self.user_conn.cursor()
+        cur.execute(
+            "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+            "FROM wordcraft_annotations WHERE session_id = ? ORDER BY id DESC",
+            (sid,),
+        )
+        out = []
+        for r in cur.fetchall():
+            out.append(
+                {
+                    "id": int(r[0]),
+                    "session_id": int(r[1]),
+                    "start_pos": int(r[2]),
+                    "end_pos": int(r[3]),
+                    "selected_text": r[4] or "",
+                    "annotation": r[5] or "",
+                    "created_at": r[6] or "",
+                    "updated_at": r[7] or "",
+                }
+            )
+        return out
+
+    def _build_wordcraft_annotation_cache(self, text):
+        sid = self._active_wordcraft_session_id()
+        cache = []
+        if sid <= 0 or not text:
+            return cache
+        for row in self.get_wordcraft_annotations(sid):
+            start_pos = int(row.get("start_pos", -1))
+            end_pos = int(row.get("end_pos", -1))
+            selected_text = row.get("selected_text", "")
+            if not (selected_text and start_pos >= 0 and end_pos > start_pos and end_pos <= len(text) and text[start_pos:end_pos] == selected_text):
+                continue
+            resolved_start = start_pos
+            resolved_end = end_pos
+            cache.append(
+                {
+                    "id": int(row.get("id", 0)),
+                    "session_id": sid,
+                    "start_pos": resolved_start,
+                    "end_pos": resolved_end,
+                    "selected_text": selected_text,
+                    "annotation": row.get("annotation", "") or "",
+                    "created_at": row.get("created_at", "") or "",
+                }
+            )
+        return cache
+
+    def apply_wordcraft_annotation_highlights(self):
+        if not hasattr(self, "inner_dialog_editor"):
+            return
+        if self.inner_active_tool != "wordcraft":
+            self.wordcraft_annotation_cache = []
+            self.inner_dialog_editor.setExtraSelections([])
+            return
+        text = self.inner_dialog_editor.toPlainText() or ""
+        self.wordcraft_annotation_cache = self._build_wordcraft_annotation_cache(text)
+        self.inner_dialog_editor.setExtraSelections(
+            self._build_doc_extra_selections(self.inner_dialog_editor, self.wordcraft_annotation_cache)
+        )
+
+    def _get_wordcraft_annotation_by_pos(self, pos):
+        for row in getattr(self, "wordcraft_annotation_cache", []) or []:
+            start_pos = int(row.get("start_pos", -1))
+            end_pos = int(row.get("end_pos", -1))
+            if start_pos <= pos < end_pos:
+                return row
+        return None
+
+    def _get_wordcraft_annotations_for_fragment(self, row):
+        if not row:
+            return []
+        sid = int(row.get("session_id", self._active_wordcraft_session_id()) or 0)
+        token = (row.get("selected_text", "") or "").strip()
+        start_pos = int(row.get("start_pos", -1))
+        end_pos = int(row.get("end_pos", -1))
+        if sid <= 0 or not token:
+            return []
+        cur = self.user_conn.cursor()
+        if start_pos >= 0 and end_pos > start_pos:
+            cur.execute(
+                "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+                "FROM wordcraft_annotations WHERE session_id = ? AND start_pos = ? AND end_pos = ? AND selected_text = ? "
+                "ORDER BY id DESC",
+                (sid, start_pos, end_pos, token),
+            )
+        else:
+            cur.execute(
+                "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+                "FROM wordcraft_annotations WHERE session_id = ? AND selected_text = ? ORDER BY id DESC",
+                (sid, token),
+            )
+        out = []
+        for r in cur.fetchall():
+            out.append(
+                {
+                    "id": int(r[0]),
+                    "session_id": int(r[1]),
+                    "start_pos": int(r[2]),
+                    "end_pos": int(r[3]),
+                    "selected_text": r[4] or "",
+                    "annotation": r[5] or "",
+                    "created_at": r[6] or "",
+                    "updated_at": r[7] or "",
+                }
+            )
+        return out
+
+    def open_wordcraft_annotation_window(self, row=None, global_pos=None):
+        dlg = getattr(self, "wordcraft_annotation_window", None)
+        if dlg is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("选词成文注释")
+            dlg.resize(700, 430)
+            dlg.installEventFilter(self)
+            root = QVBoxLayout()
+            hint = QLabel("当前片段的所有注释：")
+            hint.setWordWrap(True)
+            root.addWidget(hint)
+            token_label = QLabel("")
+            token_label.setWordWrap(True)
+            token_label.setStyleSheet("color:#61dafb;")
+            root.addWidget(token_label)
+            list_widget = QListWidget()
+            root.addWidget(list_widget, 1)
+            detail = QTextBrowser()
+            detail.setOpenExternalLinks(False)
+            detail.setPlaceholderText("选择一条注释查看完整内容")
+            root.addWidget(detail, 1)
+            btn_row = QHBoxLayout()
+            delete_btn = QPushButton("删除选中注释")
+            close_btn = QPushButton("关闭")
+            btn_row.addWidget(delete_btn)
+            btn_row.addStretch()
+            btn_row.addWidget(close_btn)
+            root.addLayout(btn_row)
+            dlg.setLayout(root)
+            self.wordcraft_annotation_window = dlg
+            self.wordcraft_annotation_window_list = list_widget
+            self.wordcraft_annotation_window_detail = detail
+            self.wordcraft_annotation_window_token = token_label
+            delete_btn.clicked.connect(self.on_wordcraft_annotation_delete_clicked)
+            close_btn.clicked.connect(dlg.close)
+            list_widget.currentItemChanged.connect(self.on_wordcraft_annotation_item_changed)
+        if row is None:
+            row = getattr(self, "wordcraft_annotation_window_anchor", None)
+            if row is None:
+                sid = self._active_wordcraft_session_id()
+                items = self.get_wordcraft_annotations(sid) if sid > 0 else []
+                row = items[0] if items else None
+            if row is None:
+                QMessageBox.information(self, "选词成文注释", "当前会话还没有可展示的注释。")
+                return
+        self.wordcraft_annotation_window_anchor = dict(row)
+        rows = self._get_wordcraft_annotations_for_fragment(row)
+        if hasattr(self, "wordcraft_annotation_window_token"):
+            token = (row.get("selected_text", "") or "").strip()
+            self.wordcraft_annotation_window_token.setText(token if token else "（未识别片段）")
+        if hasattr(self, "wordcraft_annotation_window_list"):
+            box = self.wordcraft_annotation_window_list
+            box.blockSignals(True)
+            box.clear()
+            for item_row in rows:
+                text = (item_row.get("annotation", "") or "").strip()
+                preview = text if len(text) <= 80 else (text[:80] + "...")
+                stamp = (item_row.get("created_at", "") or "").replace("T", " ")[:19]
+                label = f"{stamp}  {preview}" if stamp else preview
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, item_row)
+                box.addItem(item)
+            box.blockSignals(False)
+            if box.count() > 0:
+                box.setCurrentRow(0)
+        if hasattr(self, "wordcraft_annotation_window_detail") and not rows:
+            self.wordcraft_annotation_window_detail.setPlainText("该片段暂无注释。")
+        if global_pos is not None:
+            self.wordcraft_annotation_window.move(self._clamp_wordcraft_annotation_pos(global_pos, self.wordcraft_annotation_window))
+        self._cancel_wordcraft_annotation_close()
+        self.wordcraft_annotation_window.show()
+        self.wordcraft_annotation_window.raise_()
+        self.wordcraft_annotation_window.activateWindow()
+
+    def on_wordcraft_annotation_item_changed(self, current, _previous):
+        if not hasattr(self, "wordcraft_annotation_window_detail"):
+            return
+        if current is None:
+            self.wordcraft_annotation_window_detail.clear()
+            return
+        row = current.data(Qt.ItemDataRole.UserRole) or {}
+        self.wordcraft_annotation_window_detail.setPlainText((row.get("annotation", "") or "").strip())
+
+    def on_wordcraft_annotation_delete_clicked(self):
+        if not hasattr(self, "wordcraft_annotation_window_list"):
+            return
+        item = self.wordcraft_annotation_window_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "删除注释", "请先选择要删除的注释。")
+            return
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        ann_id = int(row.get("id", 0))
+        if ann_id <= 0:
+            return
+        cur = self.user_conn.cursor()
+        cur.execute("DELETE FROM wordcraft_annotations WHERE id = ?", (ann_id,))
+        self.user_conn.commit()
+        self.apply_wordcraft_annotation_highlights()
+        anchor = getattr(self, "wordcraft_annotation_window_anchor", None)
+        self.open_wordcraft_annotation_window(row=anchor)
+
+    def on_wordcraft_annotation_manage_clicked(self):
+        self.open_wordcraft_annotation_window()
+
+    def _cancel_wordcraft_annotation_close(self):
+        timer = getattr(self, "wordcraft_annotation_close_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _clamp_wordcraft_annotation_pos(self, pos, dlg):
+        if pos is None:
+            return None
+        target = QPoint(int(pos.x()) + 14, int(pos.y()) + 14)
+        screen = QApplication.screenAt(target)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return target
+        rect = screen.availableGeometry()
+        width = max(int(dlg.width()), int(dlg.sizeHint().width()))
+        height = max(int(dlg.height()), int(dlg.sizeHint().height()))
+        max_x = max(rect.left(), rect.right() - width + 1)
+        max_y = max(rect.top(), rect.bottom() - height + 1)
+        x = min(max(target.x(), rect.left()), max_x)
+        y = min(max(target.y(), rect.top()), max_y)
+        return QPoint(x, y)
+
+    def _schedule_wordcraft_annotation_close(self, delay_ms=500):
+        timer = getattr(self, "wordcraft_annotation_close_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._close_wordcraft_annotation_window_if_needed)
+            self.wordcraft_annotation_close_timer = timer
+        timer.start(max(1, int(delay_ms)))
+
+    def _is_mouse_on_wordcraft_annotated_fragment(self):
+        if self.inner_active_tool != "wordcraft" or not hasattr(self, "inner_dialog_editor"):
+            return False
+        local_pos = self.inner_dialog_editor.mapFromGlobal(QCursor.pos())
+        if not self.inner_dialog_editor.rect().contains(local_pos):
+            return False
+        cursor = self.inner_dialog_editor.cursorForPosition(local_pos)
+        return self._get_wordcraft_annotation_by_pos(cursor.position()) is not None
+
+    def _close_wordcraft_annotation_window_if_needed(self):
+        dlg = getattr(self, "wordcraft_annotation_window", None)
+        if dlg is None or not dlg.isVisible():
+            return
+        in_window = dlg.frameGeometry().contains(QCursor.pos())
+        if in_window or getattr(self, "wordcraft_annotation_hover_on_window", False):
+            return
+        if self._is_mouse_on_wordcraft_annotated_fragment():
+            return
+        dlg.hide()
+
+    def eventFilter(self, obj, event):
+        dlg = getattr(self, "wordcraft_annotation_window", None)
+        if dlg is not None and obj is dlg and event is not None:
+            if event.type() in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
+                self.wordcraft_annotation_hover_on_window = True
+                self._cancel_wordcraft_annotation_close()
+            elif event.type() in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                self.wordcraft_annotation_hover_on_window = False
+                self._schedule_wordcraft_annotation_close(500)
+        return False
+
+    def on_inner_dialog_mouse_move(self, event):
+        handler = getattr(self.inner_dialog_editor, "_orig_mouse_move", None) if hasattr(self, "inner_dialog_editor") else None
+        if handler is not None:
+            handler(event)
+        if self.inner_active_tool != "wordcraft" or not hasattr(self, "inner_dialog_editor"):
+            return
+        cursor = self.inner_dialog_editor.cursorForPosition(event.pos())
+        row = self._get_wordcraft_annotation_by_pos(cursor.position())
+        if not row:
+            self.wordcraft_last_hover_key = None
+            self._schedule_wordcraft_annotation_close(500)
+            return
+        key = (
+            int(row.get("start_pos", -1)),
+            int(row.get("end_pos", -1)),
+            (row.get("selected_text", "") or "").strip(),
+        )
+        if key == getattr(self, "wordcraft_last_hover_key", None):
+            self._cancel_wordcraft_annotation_close()
+            return
+        self.wordcraft_last_hover_key = key
+        self.open_wordcraft_annotation_window(row=row, global_pos=self.inner_dialog_editor.mapToGlobal(event.pos()))
+
+    def on_inner_dialog_leave(self, event):
+        handler = getattr(self.inner_dialog_editor, "_orig_leave_event", None) if hasattr(self, "inner_dialog_editor") else None
+        if handler is not None:
+            handler(event)
+        self.wordcraft_last_hover_key = None
+        self._schedule_wordcraft_annotation_close(500)
 
     def add_wordcraft_pending_segment(self, text):
         token = (text or "").strip()
@@ -937,15 +1675,19 @@ class UserFeaturesMixin:
             self.inner_active_tool = "wordcraft"
             self.update_inner_toolbar_visual()
             self.inner_dialog_editor.setPlainText("已激活“选词成文”。再次点击按钮将进入 AI 交互模式。")
+            self.apply_wordcraft_annotation_highlights()
             return
         self.run_wordcraft_ai_generation()
 
     def create_blank_inner_session(self):
         self.inner_current_session_id = None
+        self.wordcraft_session_id = None
+        self.wordcraft_last_result = {}
         self.inner_session_list.clearSelection()
         self.inner_dialog_editor.clear()
         self.wordcraft_pending_confirm = False
         self.wordcraft_pending_segments = []
+        self.apply_wordcraft_annotation_highlights()
         if hasattr(self, 'inner_confirm_btn'):
             self.inner_confirm_btn.setVisible(False)
 
@@ -992,14 +1734,23 @@ class UserFeaturesMixin:
         if not row:
             return
         content, tool, config_json = row
-        self.set_inner_markdown_preview(content or "")
+        self.wordcraft_show_assist_on = False
+        display_content = content or ""
+        if (tool or "") == "wordcraft" and not (display_content or "").lstrip().startswith("🔊"):
+            display_content = f"🔊\n{display_content}"
+        self.set_inner_markdown_preview(display_content)
         self.inner_active_tool = tool or ""
+        self.wordcraft_session_id = int(self.inner_current_session_id) if self.inner_active_tool == "wordcraft" else None
+        if self.inner_active_tool == "wordcraft":
+            self.wordcraft_last_result = self.parse_wordcraft_session_payload(content or "", config_json)
+        else:
+            self.wordcraft_last_result = {}
         self.update_inner_toolbar_visual()
-        if tool == "wordcraft" and config_json:
-            try:
-                self.wordcraft_config = json.loads(config_json)
-            except Exception:
-                pass
+        self.apply_wordcraft_annotation_highlights()
+        if tool == "wordcraft":
+            cfg = self.wordcraft_last_result.get("config", {})
+            if isinstance(cfg, dict) and cfg:
+                self.wordcraft_config = cfg
 
     def delete_current_inner_session(self):
         item = self.inner_session_list.currentItem() if hasattr(self, 'inner_session_list') else None
@@ -1009,19 +1760,22 @@ class UserFeaturesMixin:
         if not session_id:
             return
         cur = self.user_conn.cursor()
+        cur.execute('DELETE FROM wordcraft_annotations WHERE session_id = ?', (int(session_id),))
         cur.execute('DELETE FROM inner_sessions WHERE id = ?', (int(session_id),))
         self.user_conn.commit()
         self.inner_current_session_id = None
+        self.wordcraft_session_id = None
+        self.wordcraft_last_result = {}
         self.inner_dialog_editor.clear()
         self.wordcraft_pending_confirm = False
         self.wordcraft_pending_segments = []
+        self.apply_wordcraft_annotation_highlights()
         if hasattr(self, 'inner_confirm_btn'):
             self.inner_confirm_btn.setVisible(False)
         self.load_inner_sessions()
 
     def build_wordcraft_prompt(self, words, cfg):
-        decorated_words = [f"{w})" for w in words]
-        joined = ", ".join(decorated_words)
+        joined = ", ".join(words)
         mode_name = {
             "recommended": "推荐（查询时间+熟练度加权）",
             "recent": "最近查询时间",
@@ -1029,18 +1783,21 @@ class UserFeaturesMixin:
             "proficiency": "熟练度",
             "self_select": "自选择",
         }.get(cfg.get("basis", "recommended"), "推荐")
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "wordcraft_generate_prompt",
+            (
+                "你是英语学习助手。请用给定目标词写一段自然英文短文，并给出中文译文。\n"
+                "输出严格 JSON：{\"english\":\"...\",\"chinese\":\"...\",\"special_words\":[\"w1\",\"w2\"]}\n"
+                "special_words 只保留正文里出现且来自目标词的单词。\n"
+                "目标难度：{difficulty}\n选词依据：{basis}\n目标词：{words}"
+            ),
+        )
+        text = tmpl or ""
         return (
-            "你是英语学习助手。请用给定目标词串成一段英文短文。\n"
-            f"目标难度：{cfg.get('difficulty', 'CET-4')}\n"
-            f"选词依据：{mode_name}\n"
-            f"目标词：{joined}\n"
-            "要求：\n"
-            "1) 尽量覆盖全部目标词。\n"
-            "2) 每个被使用的目标词必须在词后紧跟一个右括号 )。\n"
-            "3) 输出 JSON，不要输出任何其他文本。\n"
-            "4) JSON 格式：{\"english\":\"...\",\"chinese\":\"...\"}\n"
-            "5) english 仅包含英文正文，不要标题；chinese 仅包含中文译文。\n"
-            "6) chinese 严禁包含任何类似 word) 的括号标记，绝对不要在中文译文里给词后加 )。"
+            text.replace("{difficulty}", str(cfg.get("difficulty", "CET-4")))
+            .replace("{basis}", mode_name)
+            .replace("{words}", joined)
         )
 
     def run_wordcraft_ai_generation(self):
@@ -1058,6 +1815,7 @@ class UserFeaturesMixin:
         prompt = self.build_wordcraft_prompt(words, self.wordcraft_config)
         self.set_inner_markdown_preview("正在生成，请稍候...")
         self.wordcraft_space_highlight_on = False
+        self.wordcraft_show_assist_on = False
         self.wordcraft_pending_segments = []
         self.wordcraft_pending_confirm = False
         if hasattr(self, 'inner_confirm_btn'):
@@ -1094,6 +1852,14 @@ class UserFeaturesMixin:
                 pass
             if not english_text:
                 english_text = answer
+            special_words = []
+            try:
+                obj = json.loads(answer)
+                raw_special = obj.get("special_words", []) if isinstance(obj, dict) else []
+                if isinstance(raw_special, list):
+                    special_words = [str(x).strip() for x in raw_special if str(x).strip()]
+            except Exception:
+                pass
             self.inner_tool_result_ready.emit(
                 {
                     "ok": True,
@@ -1101,6 +1867,7 @@ class UserFeaturesMixin:
                     "stage": "generate",
                     "english": english_text,
                     "chinese": chinese_text,
+                    "special_words": special_words,
                     "words": words,
                     "config": cfg,
                 }
@@ -1124,6 +1891,12 @@ class UserFeaturesMixin:
             if stage == "grade":
                 self.on_quiz_grade_result(result)
                 return
+        if tool == "doc_annotation":
+            self.on_doc_annotation_result(result)
+            return
+        if tool == "wordcraft_annotation":
+            self.on_wordcraft_annotation_result(result)
+            return
         if tool != "wordcraft":
             return
         stage = (result or {}).get("stage", "generate")
@@ -1139,8 +1912,24 @@ class UserFeaturesMixin:
         cfg = result.get("config", {})
         english_raw = result.get("english", "")
         chinese_text = result.get("chinese", "")
-        english_clean, special_words = self.strip_special_markers(english_raw)
+        english_clean, fallback_special = self.strip_special_markers(english_raw)
         chinese_clean, _ = self.strip_special_markers(chinese_text)
+        special_words = result.get("special_words", [])
+        if not isinstance(special_words, list):
+            special_words = []
+        if not special_words:
+            special_words = fallback_special
+        if special_words:
+            words_lower = {w.lower(): w for w in words}
+            deduped = []
+            seen = set()
+            for token in special_words:
+                low = (token or "").strip().lower()
+                if not low or low in seen:
+                    continue
+                seen.add(low)
+                deduped.append(words_lower.get(low, token))
+            special_words = deduped
         self.wordcraft_last_result = {
             "words": words,
             "config": cfg,
@@ -1149,41 +1938,31 @@ class UserFeaturesMixin:
             "chinese": chinese_clean,
             "special_words": special_words,
         }
+        self.update_inner_toolbar_visual()
         self.refresh_wordcraft_display()
+        self.touch_words_query_time(words)
         title = f"选词成文 {datetime.now().strftime('%m-%d %H:%M')}"
-        header_text = f"【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
-        session_content = header_text + english_clean
-        sid = self.create_inner_session(title, "wordcraft", session_content, json.dumps(cfg, ensure_ascii=False))
+        header_text = f"🔊\n【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
+        session_content = header_text + english_clean + f"\n\n【中文】\n{chinese_clean}"
+        session_payload = {
+            "wordcraft_config": dict(cfg),
+            "wordcraft_session": {
+                "words": list(words),
+                "english_clean": english_clean,
+                "chinese": chinese_clean,
+            },
+        }
+        sid = self.create_inner_session(title, "wordcraft", session_content, json.dumps(session_payload, ensure_ascii=False))
         self.wordcraft_session_id = sid
         self.inner_current_session_id = sid
         self.load_inner_sessions()
         for i in range(self.inner_session_list.count()):
-            item = self.inner_session_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == sid:
-                self.inner_session_list.setCurrentItem(item)
-                break
-        feeling_options = [
-            "1. 没有任何问题",
-            "2. 基本看懂，少量卡顿",
-            "3. 半懂半卡，需要提示",
-            "4. 困难较多，理解吃力",
-            "5. 非常困难，几乎看不懂",
-        ]
-        picked, ok = QInputDialog.getItem(self, "主观感受", "你对这段英文的阅读感受是：", feeling_options, 1, False)
-        if not ok or not picked:
-            return
-        feeling_level = int(str(picked).split(".", 1)[0])
-        self.update_inner_session_rating(sid, feeling_level)
-        if feeling_level == 1:
-            self.shift_reviewing_proficiency(words, 1)
-            self.append_wordcraft_chinese_and_save()
-            return
-        self.wordcraft_pending_confirm = True
-        self.wordcraft_pending_segments = []
-        if hasattr(self, 'inner_confirm_btn'):
-            self.inner_confirm_btn.setVisible(True)
-            self.inner_confirm_btn.setText("确认讲解（已选 0 段）")
-        QMessageBox.information(self, "下一步", "请在英文内容中右键加入不懂片段，可多次选择。完成后点击下方“确认讲解”。")
+                item = self.inner_session_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == sid:
+                    self.inner_session_list.setCurrentItem(item)
+                    break
+        if hasattr(self, "inner_confirm_btn"):
+            self.inner_confirm_btn.setVisible(False)
 
     def append_wordcraft_chinese_and_save(self):
         english_clean = self.wordcraft_last_result.get("english_clean", "")
@@ -1191,7 +1970,7 @@ class UserFeaturesMixin:
         cfg = self.wordcraft_last_result.get("config", {})
         words = self.wordcraft_last_result.get("words", [])
         final_text = (
-            f"【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
+            f"🔊\n【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
             f"{english_clean}\n\n【中文】\n{chinese}"
         )
         self.set_inner_markdown_preview(final_text)
@@ -1349,6 +2128,100 @@ class UserFeaturesMixin:
                 item.setData(Qt.ItemDataRole.UserRole, q)
                 self.apply_review_style_to_item(item, q)
                 self.reviewing_words_list.addItem(item)
+
+    def touch_words_query_time(self, words):
+        if not words:
+            return
+        ts = datetime.now().isoformat(timespec="seconds")
+        cur = self.user_conn.cursor()
+        seen = set()
+        for word in words:
+            token = (word or "").strip()
+            low = token.lower()
+            if not token or low in seen:
+                continue
+            seen.add(low)
+            cur.execute(
+                "INSERT INTO queries(query, count, last_at) VALUES(?, 1, ?) "
+                "ON CONFLICT(query) DO UPDATE SET count = count + 1, last_at = excluded.last_at",
+                (token, ts),
+            )
+        self.user_conn.commit()
+        self.refresh_internal_page()
+
+    def on_wordcraft_listen_clicked(self):
+        if self.inner_active_tool != "wordcraft":
+            return
+        english = (self.wordcraft_last_result.get("english_clean", "") or "").strip()
+        if not english and self.inner_current_session_id:
+            cur = self.user_conn.cursor()
+            cur.execute('SELECT content, config_json FROM inner_sessions WHERE id = ?', (int(self.inner_current_session_id),))
+            row = cur.fetchone()
+            if row:
+                parsed = self.parse_wordcraft_session_payload(row[0] or "", row[1])
+                english = (parsed.get("english_clean", "") or "").strip()
+                if english:
+                    self.wordcraft_last_result = parsed
+        if not english:
+            QMessageBox.information(self, "听力", "当前没有可朗读的英文内容。")
+            return
+        voice = self.settings.get("tts_voice", "en-US-GuyNeural")
+        rate = self.settings.get("tts_rate", "+0%")
+        get_tts_client().play(english, voice=voice, rate=rate)
+
+    def parse_wordcraft_session_payload(self, content, config_json):
+        text = (content or "").replace("\r\n", "\n")
+        cfg = {}
+        words = []
+        english = ""
+        chinese = ""
+        if config_json:
+            try:
+                data = json.loads(config_json)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                if isinstance(data.get("wordcraft_config"), dict):
+                    cfg = dict(data.get("wordcraft_config") or {})
+                elif "scope" in data or "basis" in data or "difficulty" in data:
+                    cfg = dict(data)
+                meta = data.get("wordcraft_session")
+                if isinstance(meta, dict):
+                    english = (meta.get("english_clean", "") or "").strip()
+                    chinese = (meta.get("chinese", "") or "").strip()
+                    raw_words = meta.get("words", [])
+                    if isinstance(raw_words, list):
+                        words = [str(x).strip() for x in raw_words if str(x).strip()]
+        lines = text.split("\n")
+        if lines and lines[0].strip().startswith("🔊"):
+            lines = lines[1:]
+        for line in lines:
+            if line.startswith("词汇：") and not words:
+                words = [w.strip() for w in line.split("：", 1)[-1].split(",") if w.strip()]
+            if line.startswith("难度：") and not cfg.get("difficulty"):
+                cfg["difficulty"] = line.split("：", 1)[-1].strip() or cfg.get("difficulty", "CET-4")
+        joined = "\n".join(lines)
+        if not english:
+            parts = joined.split("【中文】", 1)
+            before = parts[0].strip() if parts else ""
+            if before:
+                before_lines = []
+                for line in before.splitlines():
+                    token = line.strip()
+                    if token.startswith("【选词成文】") or token.startswith("词汇：") or token.startswith("难度："):
+                        continue
+                    before_lines.append(line)
+                english = "\n".join(before_lines).strip()
+        if not chinese and "【中文】" in joined:
+            after = joined.split("【中文】", 1)[-1]
+            chinese = after.split("【逐一讲解】", 1)[0].strip()
+        return {
+            "config": cfg,
+            "words": words,
+            "english_clean": english,
+            "chinese": chinese,
+            "special_words": [],
+        }
 
     def build_favorite_option_button(self):
         option_btn = QToolButton()
@@ -1902,9 +2775,46 @@ class UserFeaturesMixin:
         if not text:
             return -1, -1
         idx = text.find(selected)
-        if idx < 0:
+        if idx >= 0:
+            return idx, idx + len(selected)
+
+        # 预览区选中内容可能在空白字符上与编辑区不一致，这里做一次“空白归一化”匹配。
+        def normalize_with_map(raw):
+            out = []
+            pos_map = []
+            i = 0
+            n = len(raw)
+            while i < n:
+                ch = raw[i]
+                if ch.isspace():
+                    out.append(" ")
+                    pos_map.append(i)
+                    while i < n and raw[i].isspace():
+                        i += 1
+                    continue
+                out.append(ch)
+                pos_map.append(i)
+                i += 1
+            pos_map.append(n)
+            return "".join(out), pos_map
+
+        norm_text, text_map = normalize_with_map(text)
+        norm_sel, _ = normalize_with_map(selected)
+        norm_sel = norm_sel.strip()
+        if not norm_sel:
             return -1, -1
-        return idx, idx + len(selected)
+        norm_idx = norm_text.find(norm_sel)
+        if norm_idx < 0:
+            return -1, -1
+        start = text_map[norm_idx]
+        end_norm = norm_idx + len(norm_sel)
+        if end_norm >= len(text_map):
+            end = len(text)
+        else:
+            end = text_map[end_norm]
+        if end <= start:
+            end = min(len(text), start + len(selected))
+        return start, end
 
     def _build_doc_annotation_context(self, selected_text, start_pos, end_pos):
         if not hasattr(self, "doc_content_edit"):
@@ -1959,8 +2869,6 @@ class UserFeaturesMixin:
         end_pos = int(pending.get("end_pos", -1))
         if start_pos < 0 or end_pos <= start_pos:
             start_pos, end_pos = self._resolve_doc_selection_range(selected)
-        if start_pos < 0 or end_pos <= start_pos:
-            return
         self.doc_auto_ai_last_signature = signature
         self.on_doc_ai_explain_clicked(
             use_selection=True,
@@ -2010,10 +2918,12 @@ class UserFeaturesMixin:
                 resolved_end = found_at + len(selected_text)
             cache.append(
                 {
+                    "id": int(row.get("id", 0)) if row.get("id") is not None else 0,
                     "start_pos": resolved_start,
                     "end_pos": resolved_end,
                     "selected_text": selected_text,
                     "annotation": annotation,
+                    "created_at": row.get("created_at", "") or "",
                 }
             )
         return cache
@@ -2049,25 +2959,16 @@ class UserFeaturesMixin:
 
     def _show_doc_annotation_tooltip(self, global_pos, row):
         if not row:
-            QToolTip.hideText()
             self.doc_last_tooltip_key = None
             return
         key = (
             int(row.get("start_pos", -1)),
             int(row.get("end_pos", -1)),
-            (row.get("annotation", "") or "").strip(),
+            (row.get("selected_text", "") or "").strip(),
         )
         if key == getattr(self, "doc_last_tooltip_key", None):
             return
-        selected = (row.get("selected_text", "") or "").strip()
-        annotation = (row.get("annotation", "") or "").strip()
-        if not annotation:
-            QToolTip.hideText()
-            self.doc_last_tooltip_key = None
-            return
-        preview_text = annotation if len(annotation) <= 280 else (annotation[:280] + "...")
-        text = f"【{selected or '注解片段'}】\n{preview_text}"
-        QToolTip.showText(global_pos, text, self)
+        self.open_doc_annotation_window(row=row, global_pos=global_pos)
         self.doc_last_tooltip_key = key
 
     def on_doc_edit_mouse_move(self, event):
@@ -2085,7 +2986,6 @@ class UserFeaturesMixin:
         handler = getattr(self.doc_content_edit, "_orig_leave_event", None) if hasattr(self, "doc_content_edit") else None
         if handler is not None:
             handler(event)
-        QToolTip.hideText()
         self.doc_last_tooltip_key = None
 
     def _get_doc_annotation_by_preview_word(self, word):
@@ -2119,7 +3019,6 @@ class UserFeaturesMixin:
         handler = getattr(self.doc_md_preview, "_orig_leave_event", None) if hasattr(self, "doc_md_preview") else None
         if handler is not None:
             handler(event)
-        QToolTip.hideText()
         self.doc_last_tooltip_key = None
 
     def get_doc_annotations(self, file_path):
@@ -2127,7 +3026,7 @@ class UserFeaturesMixin:
             return []
         cur = self.user_conn.cursor()
         cur.execute(
-            "SELECT id, start_pos, end_pos, selected_text, annotation FROM doc_annotations "
+            "SELECT id, start_pos, end_pos, selected_text, annotation, created_at, updated_at FROM doc_annotations "
             "WHERE file_path = ? ORDER BY id DESC",
             (file_path,),
         )
@@ -2141,6 +3040,8 @@ class UserFeaturesMixin:
                     "end_pos": int(r[2]),
                     "selected_text": r[3] or "",
                     "annotation": r[4] or "",
+                    "created_at": r[5] or "",
+                    "updated_at": r[6] or "",
                 }
             )
         return out
@@ -2267,6 +3168,9 @@ class UserFeaturesMixin:
         menu.exec(self.doc_content_edit.mapToGlobal(pos))
         menu.deleteLater()
 
+    def on_doc_annotation_manage_clicked(self):
+        self.open_doc_annotation_window()
+
     def on_doc_ai_explain_clicked(
         self,
         use_selection=True,
@@ -2297,12 +3201,11 @@ class UserFeaturesMixin:
             else:
                 start_pos = min(tc.selectionStart(), tc.selectionEnd())
                 end_pos = max(tc.selectionStart(), tc.selectionEnd())
-        if not (use_selection and selected and start_pos >= 0 and end_pos > start_pos):
+        if not (use_selection and selected):
             if not silent_when_no_selection:
                 QMessageBox.information(self, "提示", "请先在 Markdown 编辑区选中要注解的片段。")
             return
         target_text = selected
-        source_kind = "划线片段"
         context_text = self._build_doc_annotation_context(target_text, start_pos, end_pos)
         file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
         url = self.normalize_api_url(self.settings.get("api_url", ""))
@@ -2315,8 +3218,8 @@ class UserFeaturesMixin:
             self.get_ai_prompts(),
             "doc_reader_explain_prompt",
             (
-                "你是英语学习助手。请对用户圈选的文本给出可保存的划线注解。\n"
-                "要求：标题 + 3-5 条要点（词义/语法/语境/学习提示）。\n\n"
+                "你是英语学习助手。请结合上下文解释用户圈选文本的含义。\n"
+                "输出纯文本，不要小标题、序号或 Markdown。\n\n"
                 "文档路径：\n{file_path}\n\n"
                 "待解读上下文：\n{source_context}\n\n"
                 "待解读内容：\n{selected_text}"
@@ -2324,7 +3227,6 @@ class UserFeaturesMixin:
         )
         try:
             prompt = (tmpl or "").format(
-                source_kind=source_kind,
                 selected_text=target_text,
                 source_context=context_text,
                 file_path=file_path or "未知",
@@ -2332,73 +3234,48 @@ class UserFeaturesMixin:
         except Exception:
             prompt = (
                 "你是英语学习助手。请对用户提供的内容做清晰、可学习的解读，"
-                "先讲含义，再讲语境/搭配，最后给 1-2 条学习建议。\n\n"
+                "先讲含义，再讲语境/搭配。只输出纯文本，不要小标题。\n\n"
                 f"文档路径：\n{file_path or '未知'}\n\n"
                 f"待解读上下文：\n{context_text}\n\n"
                 f"待解读内容：\n{target_text}"
             )
+        signature = (
+            file_path.lower(),
+            int(start_pos),
+            int(end_pos),
+            (target_text or "").strip(),
+        )
+        inflight = getattr(self, "doc_auto_ai_inflight_signatures", None)
+        if inflight is None:
+            inflight = set()
+            self.doc_auto_ai_inflight_signatures = inflight
+        if signature in inflight:
+            return
+        inflight.add(signature)
         self.doc_auto_ai_dialog_open = True
-        try:
-            self._open_doc_annotation_dialog(url, key, model, prompt, target_text, start_pos, end_pos)
-        finally:
-            self.doc_auto_ai_dialog_open = False
-
-    def _open_doc_annotation_dialog(self, url, key, model, prompt, selected_text, start_pos, end_pos):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("AI 划线注解")
-        dlg.resize(620, 420)
-        root = QVBoxLayout()
-        tip = QLabel("AI 正在流式生成注解，确认后可直接保存为该片段的划线注解。")
-        tip.setWordWrap(True)
-        root.addWidget(tip)
-        output = QTextBrowser()
-        output.setOpenExternalLinks(False)
-        output.setPlaceholderText("等待模型响应...")
-        root.addWidget(output, 1)
-        btn_row = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        save_btn = QPushButton("保存这条注解")
-        save_btn.setEnabled(False)
-        btn_row.addButton(save_btn, QDialogButtonBox.ButtonRole.AcceptRole)
-        root.addWidget(btn_row)
-        dlg.setLayout(root)
-        helper = _DocAnnotationSignalHelper()
-        holder = {"answer": ""}
-
-        def on_chunk(piece):
-            if not piece:
-                return
-            holder["answer"] += piece
-            output.setPlainText(holder["answer"])
-            output.verticalScrollBar().setValue(output.verticalScrollBar().maximum())
-
-        def on_done(ok, err):
-            if not ok:
-                output.append(f"\n\n请求失败：{err}")
-                return
-            save_btn.setEnabled(True)
-
-        def on_save_clicked():
-            answer = (holder.get("answer") or "").strip()
-            if not answer:
-                QMessageBox.information(self, "提示", "当前没有可保存的注解内容。")
-                return
-            self.save_doc_annotation(start_pos, end_pos, selected_text, answer)
-            self.apply_doc_annotation_highlights()
-            QMessageBox.information(self, "保存成功", "划线注解已保存。")
-            dlg.accept()
-
-        helper.chunk.connect(on_chunk)
-        helper.done.connect(on_done)
-        save_btn.clicked.connect(on_save_clicked)
-        btn_row.rejected.connect(dlg.reject)
+        self._begin_doc_annotation_stream(signature, target_text, start_pos, end_pos)
         threading.Thread(
             target=self._doc_reader_explain_worker_stream,
-            args=(url, key, model, prompt, helper),
+            args=(url, key, model, prompt, target_text, start_pos, end_pos, signature, bool(silent_when_no_selection)),
             daemon=True,
         ).start()
-        dlg.exec()
 
-    def _doc_reader_explain_worker_stream(self, url, key, model, prompt, helper):
+    def _begin_doc_annotation_stream(self, signature, selected_text, start_pos, end_pos):
+        streams = getattr(self, "doc_annotation_stream_buffers", None)
+        if streams is None:
+            streams = {}
+            self.doc_annotation_stream_buffers = streams
+        streams[signature] = ""
+        anchor = {
+            "start_pos": int(start_pos),
+            "end_pos": int(end_pos),
+            "selected_text": (selected_text or "").strip(),
+        }
+        self.open_doc_annotation_window(row=anchor)
+        if hasattr(self, "doc_annotation_window_detail"):
+            self.doc_annotation_window_detail.setPlainText("AI 正在生成注释...\n")
+
+    def _doc_reader_explain_worker_stream(self, url, key, model, prompt, selected_text, start_pos, end_pos, signature, silent):
         payload = {
             "model": model,
             "messages": [
@@ -2408,6 +3285,7 @@ class UserFeaturesMixin:
             "temperature": 0.2,
             "stream": True,
         }
+        pieces = []
         try:
             data = json.dumps(payload).encode("utf-8")
             req = request.Request(
@@ -2442,34 +3320,289 @@ class UserFeaturesMixin:
                         delta = choices[0].get("delta", {})
                         piece = delta.get("content")
                         if piece:
-                            helper.chunk.emit(piece)
+                            pieces.append(piece)
+                            self.inner_tool_result_ready.emit(
+                                {
+                                    "ok": True,
+                                    "tool": "doc_annotation",
+                                    "stage": "chunk",
+                                    "signature": signature,
+                                    "selected_text": selected_text,
+                                    "start_pos": int(start_pos),
+                                    "end_pos": int(end_pos),
+                                    "silent": bool(silent),
+                                    "piece": piece,
+                                }
+                            )
                 else:
                     resp_text = resp.read().decode("utf-8", errors="ignore")
-                    helper.chunk.emit(self.extract_text_from_response(resp_text) or "")
-            helper.done.emit(True, "")
+                    text_piece = self.extract_text_from_response(resp_text) or ""
+                    if text_piece:
+                        pieces.append(text_piece)
+                        self.inner_tool_result_ready.emit(
+                            {
+                                "ok": True,
+                                "tool": "doc_annotation",
+                                "stage": "chunk",
+                                "signature": signature,
+                                "selected_text": selected_text,
+                                "start_pos": int(start_pos),
+                                "end_pos": int(end_pos),
+                                "silent": bool(silent),
+                                "piece": text_piece,
+                            }
+                        )
+            answer = "".join(pieces).strip()
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": True,
+                    "tool": "doc_annotation",
+                    "stage": "done",
+                    "selected_text": selected_text,
+                    "start_pos": int(start_pos),
+                    "end_pos": int(end_pos),
+                    "signature": signature,
+                    "silent": bool(silent),
+                    "text": answer,
+                }
+            )
         except Exception as e:
-            helper.done.emit(False, str(e))
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": False,
+                    "tool": "doc_annotation",
+                    "stage": "done",
+                    "selected_text": selected_text,
+                    "start_pos": int(start_pos),
+                    "end_pos": int(end_pos),
+                    "signature": signature,
+                    "silent": bool(silent),
+                    "error": str(e),
+                }
+            )
+
+    def _normalize_doc_annotation_text(self, text):
+        cleaned = (text or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:text|markdown)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned.strip()
+
+    def on_doc_annotation_result(self, result):
+        stage = (result or {}).get("stage", "done")
+        signature = (result or {}).get("signature")
+        if stage == "chunk":
+            piece = (result or {}).get("piece", "")
+            if not piece:
+                return
+            streams = getattr(self, "doc_annotation_stream_buffers", None)
+            if streams is None:
+                streams = {}
+                self.doc_annotation_stream_buffers = streams
+            streams[signature] = (streams.get(signature, "") or "") + piece
+            if hasattr(self, "doc_annotation_window_detail"):
+                self.doc_annotation_window_detail.setPlainText(streams[signature])
+            return
+        signature = (result or {}).get("signature")
+        inflight = getattr(self, "doc_auto_ai_inflight_signatures", None)
+        if isinstance(inflight, set) and signature in inflight:
+            inflight.discard(signature)
+        self.doc_auto_ai_dialog_open = False
+        if not result or not result.get("ok"):
+            if not (result or {}).get("silent"):
+                QMessageBox.warning(self, "AI 注释失败", (result or {}).get("error", "未知错误"))
+            return
+        streams = getattr(self, "doc_annotation_stream_buffers", None)
+        streamed = ""
+        if isinstance(streams, dict):
+            streamed = streams.pop(signature, "")
+        note = self._normalize_doc_annotation_text(streamed or (result or {}).get("text", ""))
+        if not note:
+            if not (result or {}).get("silent"):
+                QMessageBox.information(self, "AI 注释", "模型未返回有效注释内容。")
+            return
+        row = self.save_doc_annotation(
+            int((result or {}).get("start_pos", -1)),
+            int((result or {}).get("end_pos", -1)),
+            (result or {}).get("selected_text", ""),
+            note,
+        )
+        if not row:
+            return
+        self.apply_doc_annotation_highlights()
+        self.open_doc_annotation_window(row=row)
 
     def save_doc_annotation(self, start_pos, end_pos, selected_text, annotation):
         file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
         if not file_path:
-            return
+            return None
         token = (selected_text or "").strip()
         note = (annotation or "").strip()
         if not token or not note:
-            return
+            return None
+        s_pos = int(start_pos)
+        e_pos = int(end_pos)
+        if s_pos < 0 or e_pos <= s_pos:
+            s_pos, e_pos = self._resolve_doc_selection_range(token)
+        if s_pos < 0 or e_pos <= s_pos:
+            s_pos, e_pos = 0, 0
         ts = datetime.now().isoformat(timespec="seconds")
         cur = self.user_conn.cursor()
         cur.execute(
             "INSERT INTO doc_annotations(file_path, start_pos, end_pos, selected_text, annotation, created_at, updated_at) "
             "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (file_path, int(start_pos), int(end_pos), token, note, ts, ts),
+            (file_path, int(s_pos), int(e_pos), token, note, ts, ts),
         )
+        ann_id = int(cur.lastrowid)
         self.user_conn.commit()
-        session_title = f"析文注解 [{datetime.now().strftime('%m-%d %H:%M')}]"
-        session_content = f"【文件】{file_path}\n\n【划线片段】\n{token}\n\n【注解】\n{note}"
-        self.create_inner_session(session_title, "doc_reader", session_content, json.dumps({"file_path": file_path}, ensure_ascii=False))
-        self.load_inner_sessions()
+        return {
+            "id": ann_id,
+            "start_pos": int(s_pos),
+            "end_pos": int(e_pos),
+            "selected_text": token,
+            "annotation": note,
+            "created_at": ts,
+            "updated_at": ts,
+        }
+
+    def _get_doc_annotations_for_fragment(self, row):
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        if not file_path or not row:
+            return []
+        start_pos = int(row.get("start_pos", -1))
+        end_pos = int(row.get("end_pos", -1))
+        token = (row.get("selected_text", "") or "").strip()
+        if not token:
+            return []
+        cur = self.user_conn.cursor()
+        if start_pos >= 0 and end_pos > start_pos:
+            cur.execute(
+                "SELECT id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+                "FROM doc_annotations WHERE file_path = ? AND start_pos = ? AND end_pos = ? AND selected_text = ? "
+                "ORDER BY id DESC",
+                (file_path, start_pos, end_pos, token),
+            )
+        else:
+            cur.execute(
+                "SELECT id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+                "FROM doc_annotations WHERE file_path = ? AND selected_text = ? ORDER BY id DESC",
+                (file_path, token),
+            )
+        rows = []
+        for r in cur.fetchall():
+            rows.append(
+                {
+                    "id": int(r[0]),
+                    "start_pos": int(r[1]),
+                    "end_pos": int(r[2]),
+                    "selected_text": r[3] or "",
+                    "annotation": r[4] or "",
+                    "created_at": r[5] or "",
+                    "updated_at": r[6] or "",
+                }
+            )
+        return rows
+
+    def open_doc_annotation_window(self, row=None, global_pos=None):
+        dlg = getattr(self, "doc_annotation_window", None)
+        if dlg is None:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("片段注释")
+            dlg.resize(700, 430)
+            root = QVBoxLayout()
+            hint = QLabel("当前片段的所有注释：")
+            hint.setWordWrap(True)
+            root.addWidget(hint)
+            token_label = QLabel("")
+            token_label.setWordWrap(True)
+            token_label.setStyleSheet("color:#61dafb;")
+            root.addWidget(token_label)
+            list_widget = QListWidget()
+            root.addWidget(list_widget, 1)
+            detail = QTextBrowser()
+            detail.setOpenExternalLinks(False)
+            detail.setPlaceholderText("选择一条注释查看完整内容")
+            root.addWidget(detail, 1)
+            btn_row = QHBoxLayout()
+            delete_btn = QPushButton("删除选中注释")
+            close_btn = QPushButton("关闭")
+            btn_row.addWidget(delete_btn)
+            btn_row.addStretch()
+            btn_row.addWidget(close_btn)
+            root.addLayout(btn_row)
+            dlg.setLayout(root)
+            self.doc_annotation_window = dlg
+            self.doc_annotation_window_list = list_widget
+            self.doc_annotation_window_detail = detail
+            self.doc_annotation_window_token = token_label
+            delete_btn.clicked.connect(self.on_doc_annotation_delete_clicked)
+            close_btn.clicked.connect(dlg.close)
+            list_widget.currentItemChanged.connect(self.on_doc_annotation_item_changed)
+        if row is None:
+            row = getattr(self, "doc_annotation_window_anchor", None)
+            if row is None:
+                file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+                items = self.get_doc_annotations(file_path) if file_path else []
+                row = items[0] if items else None
+            if row is None:
+                QMessageBox.information(self, "片段注释", "当前文档还没有可展示的注释。")
+                return
+        self.doc_annotation_window_anchor = dict(row)
+        rows = self._get_doc_annotations_for_fragment(row)
+        if hasattr(self, "doc_annotation_window_token"):
+            token = (row.get("selected_text", "") or "").strip()
+            self.doc_annotation_window_token.setText(token if token else "（未识别片段）")
+        if hasattr(self, "doc_annotation_window_list"):
+            box = self.doc_annotation_window_list
+            box.blockSignals(True)
+            box.clear()
+            for item_row in rows:
+                text = (item_row.get("annotation", "") or "").strip()
+                preview = text if len(text) <= 80 else (text[:80] + "...")
+                stamp = (item_row.get("created_at", "") or "").replace("T", " ")[:19]
+                label = f"{stamp}  {preview}" if stamp else preview
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, item_row)
+                box.addItem(item)
+            box.blockSignals(False)
+            if box.count() > 0:
+                box.setCurrentRow(0)
+        if hasattr(self, "doc_annotation_window_detail"):
+            if not rows:
+                self.doc_annotation_window_detail.setPlainText("该片段暂无注释。")
+        if global_pos is not None:
+            self.doc_annotation_window.move(global_pos)
+        self.doc_annotation_window.show()
+        self.doc_annotation_window.raise_()
+        self.doc_annotation_window.activateWindow()
+
+    def on_doc_annotation_item_changed(self, current, _previous):
+        if not hasattr(self, "doc_annotation_window_detail"):
+            return
+        if current is None:
+            self.doc_annotation_window_detail.clear()
+            return
+        row = current.data(Qt.ItemDataRole.UserRole) or {}
+        note = (row.get("annotation", "") or "").strip()
+        self.doc_annotation_window_detail.setPlainText(note)
+
+    def on_doc_annotation_delete_clicked(self):
+        if not hasattr(self, "doc_annotation_window_list"):
+            return
+        item = self.doc_annotation_window_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "删除注释", "请先选择要删除的注释。")
+            return
+        row = item.data(Qt.ItemDataRole.UserRole) or {}
+        ann_id = int(row.get("id", 0))
+        if ann_id <= 0:
+            return
+        cur = self.user_conn.cursor()
+        cur.execute("DELETE FROM doc_annotations WHERE id = ?", (ann_id,))
+        self.user_conn.commit()
+        self.apply_doc_annotation_highlights()
+        anchor = getattr(self, "doc_annotation_window_anchor", None)
+        self.open_doc_annotation_window(row=anchor)
 
     def on_doc_save_markdown_clicked(self):
         file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))

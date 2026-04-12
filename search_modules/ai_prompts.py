@@ -137,20 +137,33 @@ def default_ai_prompts():
         },
 
         # 文档解读：析文标签页（框选片段做划线注解）
+        "wordcraft_generate_prompt": {
+            "agent": "UserFeaturesMixin.build_wordcraft_prompt",
+            "purpose": "选词成文生成（英文正文+中文译文+命中特殊词）",
+            "text": (
+                "你是英语学习助手。请用给定目标词写一段自然英文短文，并给出中文译文。\n"
+                "输出要求：\n"
+                "1) 严格只输出 JSON，不要输出任何额外文本。\n"
+                "2) JSON 格式：{\"english\":\"...\",\"chinese\":\"...\",\"special_words\":[\"w1\",\"w2\"]}\n"
+                "3) english 只保留英文正文；chinese 只保留中文译文。\n"
+                "4) special_words 仅包含正文里实际出现、且来自目标词列表的英文单词（去重，按出现顺序）。\n\n"
+                "目标难度：{difficulty}\n"
+                "选词依据：{basis}\n"
+                "目标词：{words}"
+            ),
+        },
         "doc_reader_explain_prompt": {
             "agent": "UserFeaturesMixin.on_doc_ai_explain_clicked",
-            "purpose": "对框选的 Markdown 片段输出可保存的简明注解",
+            "purpose": "对框选片段输出纯文本注释（结合上下文）",
             "text": (
-                "你是英语学习助手。请针对用户框选的 Markdown 原文片段生成“划线注解”。\n"
-                "你会同时收到“待解读上下文”和“待解读内容”，必须结合上下文来判断词义与语境作用。\n"
+                "你是英语学习助手。请结合上下文解释用户选中的英文片段是什么意思。\n"
                 "输出要求：\n"
-                "1) 标题行：一句 12-18 字以内的注解题目。\n"
-                "2) 正文：3-5 条要点，依次涵盖词义/语法/语境/学习提示。\n"
-                "3) 风格：简洁、可执行，避免空话。\n"
-                "4) 以中文为主，可穿插少量英文关键词。\n\n"
+                "1) 只输出纯文本，不要标题、序号、Markdown、代码块。\n"
+                "2) 先给片段在此处的核心含义，再补充关键语境点或语法点。\n"
+                "3) 内容务实、简短、易懂，中文为主。\n\n"
                 "待解读上下文：\n{source_context}\n\n"
                 "待解读内容：\n{selected_text}\n\n"
-                "输出仅为注解正文，不要加多余前后缀。"
+                "仅输出最终注释正文。"
             ),
         },
     }
