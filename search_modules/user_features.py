@@ -1,10 +1,10 @@
 import html
-import concurrent.futures
 import json
 import os
 import random
 import re
 import shutil
+import sqlite3
 import threading
 from datetime import datetime
 from urllib.parse import quote, unquote
@@ -450,12 +450,13 @@ class UserFeaturesMixin:
         }
         self.save_quiz_config()
 
-    def get_word_translation(self, word):
+    def get_word_translation(self, word, dict_cursor=None):
         token = (word or "").strip()
         if not token:
             return ""
-        self.cursor.execute("SELECT translation, detail, definition FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1", (token,))
-        row = self.cursor.fetchone()
+        cur = dict_cursor if dict_cursor is not None else self.cursor
+        cur.execute("SELECT translation, detail, definition FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1", (token,))
+        row = cur.fetchone()
         parts = []
         if row:
             parts = [row[0] or "", row[1] or "", row[2] or ""]
@@ -463,21 +464,23 @@ class UserFeaturesMixin:
         text = re.sub(r"\s+", " ", text)
         return text[:180]
 
-    def pick_distractor_words(self, word, count=3):
+    def pick_distractor_words(self, word, count=3, dict_cursor=None, user_cursor=None):
         token = (word or "").strip()
         if not token:
             return []
+        dict_cur = dict_cursor if dict_cursor is not None else self.cursor
+        review_cur = user_cursor if user_cursor is not None else self.user_conn.cursor()
         cands = []
         if len(token) >= 3:
             prefix = token[:3]
-            self.cursor.execute(
+            dict_cur.execute(
                 "SELECT word FROM stardict WHERE word LIKE ? COLLATE NOCASE AND word != ? LIMIT 60",
                 (f"{prefix}%", token),
             )
-            cands.extend([r[0] for r in self.cursor.fetchall() if r and r[0]])
+            cands.extend([r[0] for r in dict_cur.fetchall() if r and r[0]])
         if len(cands) < count:
-            self.cursor.execute("SELECT query FROM reviewing WHERE query != ? COLLATE NOCASE ORDER BY RANDOM() LIMIT 80", (token,))
-            cands.extend([r[0] for r in self.cursor.fetchall() if r and r[0]])
+            review_cur.execute("SELECT query FROM reviewing WHERE query != ? COLLATE NOCASE ORDER BY RANDOM() LIMIT 80", (token,))
+            cands.extend([r[0] for r in review_cur.fetchall() if r and r[0]])
         out = []
         seen = set([token.lower()])
         for w in cands:
@@ -490,8 +493,8 @@ class UserFeaturesMixin:
                 break
         return out
 
-    def build_quiz_question_locally(self, word, qtype):
-        translation = self.get_word_translation(word) or "（暂无释义）"
+    def build_quiz_question_locally(self, word, qtype, dict_cursor=None, user_cursor=None):
+        translation = self.get_word_translation(word, dict_cursor=dict_cursor) or "（暂无释义）"
         if qtype == 1:
             return {
                 "type": 1,
@@ -499,10 +502,10 @@ class UserFeaturesMixin:
                 "prompt": f"请听音并根据中文释义拼写英文：{translation}",
                 "answer": word,
             }
-        distractor_words = self.pick_distractor_words(word, count=3)
+        distractor_words = self.pick_distractor_words(word, count=3, dict_cursor=dict_cursor, user_cursor=user_cursor)
         choices = [{"text": translation, "correct": True}]
         for dw in distractor_words:
-            dtrans = self.get_word_translation(dw) or f"{dw} 的释义"
+            dtrans = self.get_word_translation(dw, dict_cursor=dict_cursor) or f"{dw} 的释义"
             choices.append({"text": dtrans, "correct": False, "source_word": dw})
         random.shuffle(choices)
         if qtype == 2:
@@ -520,8 +523,8 @@ class UserFeaturesMixin:
             "choices": choices,
         }
 
-    def build_quiz_question_with_ai(self, word, qtype):
-        base = self.build_quiz_question_locally(word, qtype)
+    def build_quiz_question_with_ai(self, word, qtype, dict_cursor=None, user_cursor=None):
+        base = self.build_quiz_question_locally(word, qtype, dict_cursor=dict_cursor, user_cursor=user_cursor)
         if qtype not in (2, 3):
             return base
         url = self.normalize_api_url(self.settings.get('api_url', ''))
@@ -537,7 +540,7 @@ class UserFeaturesMixin:
             f"题型: {qtype}\n"
             f"语境难度: {difficulty}\n"
             f"可用于干扰的形近词: {', '.join([d for d in distractors if d])}\n"
-            f"正确中文释义: {self.get_word_translation(word) or word}\n"
+            f"正确中文释义: {self.get_word_translation(word, dict_cursor=dict_cursor) or word}\n"
             "要求：每次只出这一题，不要引用其它题内容。"
             "如果是题型3，context 必须是英文语境句子；选项必须是中文释义。\n"
             "返回格式："
@@ -631,9 +634,21 @@ class UserFeaturesMixin:
             if not pairs:
                 self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "build", "error": "没有可用题目。"})
                 return
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(pairs))) as ex:
-                futures = [ex.submit(self.build_quiz_question_with_ai, w, t) for w, t in pairs]
-                questions = [f.result() for f in futures]
+            root_dir = self._project_root_dir()
+            dict_db_path = os.path.join(root_dir, "stardict.db")
+            user_db_path = os.path.join(root_dir, "user_data.db")
+            with sqlite3.connect(dict_db_path) as dict_conn, sqlite3.connect(user_db_path) as user_conn:
+                dict_cur = dict_conn.cursor()
+                user_cur = user_conn.cursor()
+                questions = [
+                    self.build_quiz_question_with_ai(
+                        w,
+                        t,
+                        dict_cursor=dict_cur,
+                        user_cursor=user_cur,
+                    )
+                    for w, t in pairs
+                ]
             self.inner_tool_result_ready.emit({"ok": True, "tool": "quiz", "stage": "build", "questions": questions})
         except Exception as e:
             self.inner_tool_result_ready.emit({"ok": False, "tool": "quiz", "stage": "build", "error": str(e)})
