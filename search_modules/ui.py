@@ -605,7 +605,7 @@ class UIMixin:
         doc_meta.setStyleSheet("color: #abb2bf; margin-bottom: 8px;")
         doc_layout.addWidget(doc_meta)
 
-        doc_desc = QLabel("仅支持 Markdown（.md）。框选后会自动生成并保存 AI 注释，片段会被划线标记，鼠标移动到片段可直接打开注释窗口。")
+        doc_desc = QLabel("仅支持 Markdown（.md）。框选后会自动生成并保存 AI 注释，片段会被划线标记，鼠标在片段上停留约 0.5 秒会打开注释窗口。")
         doc_desc.setWordWrap(True)
         doc_desc.setStyleSheet("color: #5c6370;")
         doc_layout.addWidget(doc_desc)
@@ -623,6 +623,9 @@ class UIMixin:
         self.doc_save_btn = QPushButton("💾 保存 Markdown")
         self.doc_save_btn.clicked.connect(self.on_doc_save_markdown_clicked)
         doc_btn_layout.addWidget(self.doc_save_btn)
+        self.doc_delete_btn = QPushButton("🗑 删除 Markdown")
+        self.doc_delete_btn.clicked.connect(self.on_doc_delete_markdown_clicked)
+        doc_btn_layout.addWidget(self.doc_delete_btn)
         self.doc_annotations_btn = QPushButton("🗂 注释管理")
         self.doc_annotations_btn.clicked.connect(self.on_doc_annotation_manage_clicked)
         doc_btn_layout.addWidget(self.doc_annotations_btn)

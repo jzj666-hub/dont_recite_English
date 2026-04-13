@@ -1249,9 +1249,42 @@ class UserFeaturesMixin:
         doc = QTextDocument()
         doc.setMarkdown(text or "")
         html_text = doc.toHtml()
-        m = re.search(r"<body[^>]*>([\s\S]*)</body>", html_text, re.IGNORECASE)
-        if m:
-            return m.group(1)
+        c = getattr(self, "colors", {}) or {}
+        text_color = c.get("text", "#ffffff")
+        accent_color = c.get("accent", "#61dafb")
+        # 富文本渲染不会稳定继承 QSS 的 color，需要在 HTML 中显式声明主题色。
+        theme_css = (
+            "<style type=\"text/css\">"
+            f"body, p, li, h1, h2, h3, h4, h5, h6, span {{ color: {text_color}; }}"
+            f"a {{ color: {accent_color}; }}"
+            "</style>"
+        )
+        if re.search(r"</head>", html_text, re.IGNORECASE):
+            html_text = re.sub(r"</head>", theme_css + "</head>", html_text, count=1, flags=re.IGNORECASE)
+        else:
+            html_text = "<html><head>" + theme_css + "</head>" + html_text + "</html>"
+
+        def _apply_body_style(match):
+            attrs = match.group(1) or ""
+            extra_style = f" color: {text_color}; background-color: transparent;"
+            style_match = re.search(r'style="([^"]*)"', attrs, re.IGNORECASE)
+            if style_match:
+                merged = (style_match.group(1) or "").strip()
+                if merged and not merged.endswith(";"):
+                    merged += ";"
+                merged += extra_style.strip()
+                attrs = re.sub(
+                    r'style="([^"]*)"',
+                    f'style="{merged}"',
+                    attrs,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                attrs += f' style="{extra_style.strip()}"'
+            return f"<body{attrs}>"
+
+        html_text = re.sub(r"<body([^>]*)>", _apply_body_style, html_text, count=1, flags=re.IGNORECASE)
         return html_text
 
     def set_inner_markdown_preview(self, text):
@@ -3208,8 +3241,19 @@ class UserFeaturesMixin:
         if not hasattr(self, "doc_content_edit") or not hasattr(self, "doc_md_preview"):
             return
         md = self.doc_content_edit.toPlainText()
-        html_fragment = self.markdown_to_html_fragment(md)
-        self.doc_md_preview.setHtml(html_fragment)
+        c = getattr(self, "colors", {}) or {}
+        text_color = c.get("text", "#ffffff")
+        accent_color = c.get("accent", "#61dafb")
+        css = (
+            f"body, p, li, h1, h2, h3, h4, h5, h6 {{ color: {text_color}; }}"
+            f"a {{ color: {accent_color}; }}"
+        )
+        try:
+            self.doc_md_preview.document().setDefaultStyleSheet(css)
+            self.doc_md_preview.setMarkdown(md or "")
+        except Exception:
+            html_fragment = self.markdown_to_html_fragment(md)
+            self.doc_md_preview.setHtml(html_fragment)
 
     def on_doc_mode_preview_clicked(self):
         self.update_doc_markdown_preview()
@@ -3428,13 +3472,61 @@ class UserFeaturesMixin:
                 break
             matches.append(idx)
             begin = idx + len(token)
-        if not matches:
+        if matches:
+            if start_hint >= 0:
+                best_start = min(matches, key=lambda pos: abs(pos - start_hint))
+            else:
+                best_start = matches[0]
+            return best_start, best_start + len(token)
+
+        # 预览模式下会对空白做规范化，这里做一次空白归一化匹配，避免已保存注释无法回显。
+        def normalize_with_map(raw):
+            out = []
+            pos_map = []
+            i = 0
+            n = len(raw)
+            while i < n:
+                ch = raw[i]
+                if ch.isspace():
+                    out.append(" ")
+                    pos_map.append(i)
+                    while i < n and raw[i].isspace():
+                        i += 1
+                    continue
+                out.append(ch)
+                pos_map.append(i)
+                i += 1
+            pos_map.append(n)
+            return "".join(out), pos_map
+
+        norm_text, text_map = normalize_with_map(text)
+        norm_token, _ = normalize_with_map(token)
+        norm_token = norm_token.strip()
+        if not norm_token:
+            return -1, -1
+        norm_matches = []
+        begin = 0
+        while True:
+            idx = norm_text.find(norm_token, begin)
+            if idx < 0:
+                break
+            norm_matches.append(idx)
+            begin = idx + len(norm_token)
+        if not norm_matches:
             return -1, -1
         if start_hint >= 0:
-            best_start = min(matches, key=lambda pos: abs(pos - start_hint))
+            best_norm_start = min(norm_matches, key=lambda pos: abs(text_map[pos] - start_hint))
         else:
-            best_start = matches[0]
-        return best_start, best_start + len(token)
+            best_norm_start = norm_matches[0]
+        start = text_map[best_norm_start]
+        end_norm = best_norm_start + len(norm_token)
+        if end_norm >= len(text_map):
+            end = len(text)
+        else:
+            end = text_map[end_norm]
+        if end <= start:
+            end = min(len(text), start + len(token))
+        return start, end
 
     def _highlight_text_brush_color(self):
         if hasattr(self, "colors"):
@@ -3504,6 +3596,10 @@ class UserFeaturesMixin:
 
     def _show_doc_annotation_tooltip(self, global_pos, row):
         if not row:
+            self._cancel_doc_annotation_hover_open()
+            self.doc_hover_pending_key = None
+            self.doc_hover_pending_row = None
+            self.doc_hover_pending_pos = None
             self.doc_last_tooltip_key = None
             return
         key = (
@@ -3512,9 +3608,44 @@ class UserFeaturesMixin:
             (row.get("selected_text", "") or "").strip(),
         )
         if key == getattr(self, "doc_last_tooltip_key", None):
+            self._cancel_doc_annotation_hover_open()
+            self.doc_hover_pending_key = None
+            self.doc_hover_pending_row = None
+            self.doc_hover_pending_pos = None
             return
+        pending_key = getattr(self, "doc_hover_pending_key", None)
+        if key == pending_key:
+            self.doc_hover_pending_pos = QPoint(int(global_pos.x()), int(global_pos.y())) if global_pos is not None else None
+            return
+        self.doc_hover_pending_key = key
+        self.doc_hover_pending_row = dict(row)
+        self.doc_hover_pending_pos = QPoint(int(global_pos.x()), int(global_pos.y())) if global_pos is not None else None
+        timer = getattr(self, "doc_hover_open_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._open_pending_doc_annotation_hover)
+            self.doc_hover_open_timer = timer
+        timer.start(500)
+
+    def _cancel_doc_annotation_hover_open(self):
+        timer = getattr(self, "doc_hover_open_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _open_pending_doc_annotation_hover(self):
+        row = getattr(self, "doc_hover_pending_row", None)
+        key = getattr(self, "doc_hover_pending_key", None)
+        if not row or not key:
+            return
+        if key == getattr(self, "doc_last_tooltip_key", None):
+            return
+        global_pos = getattr(self, "doc_hover_pending_pos", None)
         self.open_doc_annotation_window(row=row, global_pos=global_pos)
         self.doc_last_tooltip_key = key
+        self.doc_hover_pending_key = None
+        self.doc_hover_pending_row = None
+        self.doc_hover_pending_pos = None
 
     def on_doc_edit_mouse_move(self, event):
         handler = getattr(self.doc_content_edit, "_orig_mouse_move", None) if hasattr(self, "doc_content_edit") else None
@@ -3531,6 +3662,10 @@ class UserFeaturesMixin:
         handler = getattr(self.doc_content_edit, "_orig_leave_event", None) if hasattr(self, "doc_content_edit") else None
         if handler is not None:
             handler(event)
+        self._cancel_doc_annotation_hover_open()
+        self.doc_hover_pending_key = None
+        self.doc_hover_pending_row = None
+        self.doc_hover_pending_pos = None
         self.doc_last_tooltip_key = None
 
     def _get_doc_annotation_by_preview_word(self, word):
@@ -3564,6 +3699,10 @@ class UserFeaturesMixin:
         handler = getattr(self.doc_md_preview, "_orig_leave_event", None) if hasattr(self, "doc_md_preview") else None
         if handler is not None:
             handler(event)
+        self._cancel_doc_annotation_hover_open()
+        self.doc_hover_pending_key = None
+        self.doc_hover_pending_row = None
+        self.doc_hover_pending_pos = None
         self.doc_last_tooltip_key = None
 
     def get_doc_annotations(self, file_path):
@@ -4053,7 +4192,9 @@ class UserFeaturesMixin:
         if dlg is None:
             dlg = QDialog(self)
             dlg.setWindowTitle("片段注释")
-            dlg.resize(700, 430)
+            dlg.resize(820, 560)
+            dlg.setSizeGripEnabled(True)
+            dlg.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
             root = QVBoxLayout()
             hint = QLabel("当前片段的所有注释：")
             hint.setWordWrap(True)
@@ -4063,15 +4204,19 @@ class UserFeaturesMixin:
             token_label.setStyleSheet("color:#61dafb;")
             root.addWidget(token_label)
             list_widget = QListWidget()
+            list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
             root.addWidget(list_widget, 1)
             detail = QTextBrowser()
             detail.setOpenExternalLinks(False)
+            detail.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
             detail.setPlaceholderText("选择一条注释查看完整内容")
             root.addWidget(detail, 1)
             btn_row = QHBoxLayout()
             delete_btn = QPushButton("删除选中注释")
+            fullscreen_btn = QPushButton("全屏")
             close_btn = QPushButton("关闭")
             btn_row.addWidget(delete_btn)
+            btn_row.addWidget(fullscreen_btn)
             btn_row.addStretch()
             btn_row.addWidget(close_btn)
             root.addLayout(btn_row)
@@ -4080,7 +4225,9 @@ class UserFeaturesMixin:
             self.doc_annotation_window_list = list_widget
             self.doc_annotation_window_detail = detail
             self.doc_annotation_window_token = token_label
+            self.doc_annotation_window_fullscreen_btn = fullscreen_btn
             delete_btn.clicked.connect(self.on_doc_annotation_delete_clicked)
+            fullscreen_btn.clicked.connect(self.toggle_doc_annotation_window_fullscreen)
             close_btn.clicked.connect(dlg.close)
             list_widget.currentItemChanged.connect(self.on_doc_annotation_item_changed)
         if row is None:
@@ -4116,10 +4263,47 @@ class UserFeaturesMixin:
             if not rows:
                 self.doc_annotation_window_detail.setPlainText("该片段暂无注释。")
         if global_pos is not None:
-            self.doc_annotation_window.move(global_pos)
+            target = self._clamp_doc_annotation_pos(global_pos, self.doc_annotation_window)
+            if target is not None:
+                self.doc_annotation_window.move(target)
+        btn = getattr(self, "doc_annotation_window_fullscreen_btn", None)
+        if btn is not None:
+            btn.setText("退出全屏" if self.doc_annotation_window.isFullScreen() else "全屏")
         self.doc_annotation_window.show()
         self.doc_annotation_window.raise_()
         self.doc_annotation_window.activateWindow()
+
+    def _clamp_doc_annotation_pos(self, pos, dlg):
+        if pos is None:
+            return None
+        target = QPoint(int(pos.x()) + 14, int(pos.y()) + 14)
+        screen = QApplication.screenAt(target)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return target
+        rect = screen.availableGeometry()
+        width = max(int(dlg.width()), int(dlg.sizeHint().width()))
+        height = max(int(dlg.height()), int(dlg.sizeHint().height()))
+        max_x = max(rect.left(), rect.right() - width + 1)
+        max_y = max(rect.top(), rect.bottom() - height + 1)
+        x = min(max(target.x(), rect.left()), max_x)
+        y = min(max(target.y(), rect.top()), max_y)
+        return QPoint(x, y)
+
+    def toggle_doc_annotation_window_fullscreen(self):
+        dlg = getattr(self, "doc_annotation_window", None)
+        if dlg is None:
+            return
+        btn = getattr(self, "doc_annotation_window_fullscreen_btn", None)
+        if dlg.isFullScreen():
+            dlg.showNormal()
+            if btn is not None:
+                btn.setText("全屏")
+            return
+        dlg.showFullScreen()
+        if btn is not None:
+            btn.setText("退出全屏")
 
     def on_doc_annotation_item_changed(self, current, _previous):
         if not hasattr(self, "doc_annotation_window_detail"):
@@ -4170,6 +4354,55 @@ class UserFeaturesMixin:
             QMessageBox.information(self, "保存成功", f"Markdown 已保存到：\n{file_path}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", f"无法保存 Markdown：{str(e)}")
+
+    def on_doc_delete_markdown_clicked(self):
+        file_path = self._normalize_doc_note_path(getattr(self, "current_doc_reader_path", ""))
+        if not file_path:
+            QMessageBox.information(self, "提示", "请先导入 Markdown 文件。")
+            return
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "删除失败", "当前 Markdown 文件不存在或已被移除。")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "删除 Markdown",
+            f"确认删除当前 Markdown 吗？\n{file_path}\n\n这会同时删除该文档的析文注释记录。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            QMessageBox.warning(self, "删除失败", f"无法删除 Markdown：{str(e)}")
+            return
+        norm_path = self._normalize_doc_note_path(file_path)
+        cur = self.user_conn.cursor()
+        cur.execute("DELETE FROM doc_annotations WHERE file_path = ?", (norm_path,))
+        cur.execute("DELETE FROM doc_notes WHERE file_path = ?", (norm_path,))
+        self.user_conn.commit()
+        self.current_doc_reader_path = ""
+        self.current_doc_reader_text = ""
+        self.doc_last_selected_text = ""
+        self.doc_last_selection_start = -1
+        self.doc_last_selection_end = -1
+        self.doc_auto_ai_last_signature = None
+        self.doc_last_tooltip_key = None
+        self.doc_hover_pending_key = None
+        self.doc_hover_pending_row = None
+        self.doc_hover_pending_pos = None
+        self._cancel_doc_annotation_hover_open()
+        if hasattr(self, "doc_current_path_label"):
+            self.doc_current_path_label.setText("当前文档：未导入")
+        if hasattr(self, "doc_content_edit"):
+            self.doc_content_edit.clear()
+        self.update_doc_markdown_preview()
+        self.apply_doc_annotation_highlights()
+        self.refresh_doc_markdown_file_list()
+        if hasattr(self, "doc_annotation_window") and self.doc_annotation_window is not None:
+            self.doc_annotation_window.hide()
+        QMessageBox.information(self, "删除成功", "当前 Markdown 和关联析文注释已删除。")
 
 
     def safe_navigate_to_linked_word(self, target):
