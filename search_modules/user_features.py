@@ -40,6 +40,12 @@ class _DocEditOutsideClickFilter(QObject):
         ):
             try:
                 global_pos = event.globalPosition().toPoint()
+                # 点击注释窗口（及其子控件）时，不应触发“离开编辑区自动回到预览”。
+                anno_dlg = getattr(owner, "doc_annotation_window", None)
+                if anno_dlg is not None and anno_dlg.isVisible():
+                    dlg_pos = anno_dlg.mapFromGlobal(global_pos)
+                    if anno_dlg.rect().contains(dlg_pos):
+                        return False
                 local_pos = owner.doc_content_edit.mapFromGlobal(global_pos)
                 if not owner.doc_content_edit.rect().contains(local_pos):
                     owner.on_doc_mode_preview_clicked()
@@ -4155,10 +4161,21 @@ class UserFeaturesMixin:
             return []
         start_pos = int(row.get("start_pos", -1))
         end_pos = int(row.get("end_pos", -1))
+        ann_id = int(row.get("id", 0) or 0)
         token = (row.get("selected_text", "") or "").strip()
         if not token:
             return []
         cur = self.user_conn.cursor()
+        if ann_id > 0:
+            cur.execute(
+                "SELECT id, start_pos, end_pos, selected_text FROM doc_annotations WHERE id = ? AND file_path = ?",
+                (ann_id, file_path),
+            )
+            anchor = cur.fetchone()
+            if anchor:
+                start_pos = int(anchor[1])
+                end_pos = int(anchor[2])
+                token = (anchor[3] or "").strip() or token
         if start_pos >= 0 and end_pos > start_pos:
             cur.execute(
                 "SELECT id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
@@ -4166,14 +4183,23 @@ class UserFeaturesMixin:
                 "ORDER BY id DESC",
                 (file_path, start_pos, end_pos, token),
             )
+            fetched = cur.fetchall()
+            if not fetched:
+                cur.execute(
+                    "SELECT id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+                    "FROM doc_annotations WHERE file_path = ? AND selected_text = ? ORDER BY id DESC",
+                    (file_path, token),
+                )
+                fetched = cur.fetchall()
         else:
             cur.execute(
                 "SELECT id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
                 "FROM doc_annotations WHERE file_path = ? AND selected_text = ? ORDER BY id DESC",
                 (file_path, token),
             )
+            fetched = cur.fetchall()
         rows = []
-        for r in cur.fetchall():
+        for r in fetched:
             rows.append(
                 {
                     "id": int(r[0]),
