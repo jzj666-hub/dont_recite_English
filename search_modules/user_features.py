@@ -3215,6 +3215,7 @@ class UserFeaturesMixin:
         self.update_doc_markdown_preview()
         if hasattr(self, "doc_content_stack") and hasattr(self, "doc_md_preview"):
             self.doc_content_stack.setCurrentWidget(self.doc_md_preview)
+        self.apply_doc_annotation_highlights()
 
     def on_doc_mode_edit_clicked(self):
         if hasattr(self, "doc_content_stack") and hasattr(self, "doc_content_edit"):
@@ -3407,10 +3408,33 @@ class UserFeaturesMixin:
 
     def on_doc_edit_focus_out(self, event):
         QTextEdit.focusOutEvent(self.doc_content_edit, event)
-        if getattr(self, "doc_auto_ai_dialog_open", False):
-            return
-        if hasattr(self, "doc_content_stack") and hasattr(self, "doc_md_preview"):
-            self.on_doc_mode_preview_clicked()
+
+    def _resolve_doc_annotation_range(self, text, selected_text, start_hint=-1, end_hint=-1):
+        token = selected_text or ""
+        if not text or not token:
+            return -1, -1
+        try:
+            start_hint = int(start_hint)
+            end_hint = int(end_hint)
+        except Exception:
+            start_hint, end_hint = -1, -1
+        if start_hint >= 0 and end_hint > start_hint and end_hint <= len(text) and text[start_hint:end_hint] == token:
+            return start_hint, end_hint
+        matches = []
+        begin = 0
+        while True:
+            idx = text.find(token, begin)
+            if idx < 0:
+                break
+            matches.append(idx)
+            begin = idx + len(token)
+        if not matches:
+            return -1, -1
+        if start_hint >= 0:
+            best_start = min(matches, key=lambda pos: abs(pos - start_hint))
+        else:
+            best_start = matches[0]
+        return best_start, best_start + len(token)
 
     def _highlight_text_brush_color(self):
         if hasattr(self, "colors"):
@@ -3434,15 +3458,9 @@ class UserFeaturesMixin:
             end_pos = int(row.get("end_pos", -1))
             selected_text = row.get("selected_text", "")
             annotation = row.get("annotation", "")
-            if selected_text and start_pos >= 0 and end_pos > start_pos and end_pos <= len(text) and text[start_pos:end_pos] == selected_text:
-                resolved_start = start_pos
-                resolved_end = end_pos
-            else:
-                found_at = text.find(selected_text)
-                if found_at < 0:
-                    continue
-                resolved_start = found_at
-                resolved_end = found_at + len(selected_text)
+            resolved_start, resolved_end = self._resolve_doc_annotation_range(text, selected_text, start_pos, end_pos)
+            if resolved_start < 0 or resolved_end <= resolved_start:
+                continue
             cache.append(
                 {
                     "id": int(row.get("id", 0)) if row.get("id") is not None else 0,
@@ -4129,6 +4147,11 @@ class UserFeaturesMixin:
         self.user_conn.commit()
         self.apply_doc_annotation_highlights()
         anchor = getattr(self, "doc_annotation_window_anchor", None)
+        if anchor and not self._get_doc_annotations_for_fragment(anchor):
+            self.doc_annotation_window_anchor = None
+            self.doc_last_tooltip_key = None
+            self.open_doc_annotation_window(row=None)
+            return
         self.open_doc_annotation_window(row=anchor)
 
     def on_doc_save_markdown_clicked(self):
