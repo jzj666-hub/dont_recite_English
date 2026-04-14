@@ -1,8 +1,8 @@
 from datetime import datetime
 import json
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, QUrl
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette, QTextCursor, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QTimer, Qt, QUrl
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QPalette, QShortcut, QTextCursor, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QKeySequenceEdit,
     QScrollArea,
     QSlider,
     QStackedLayout,
@@ -49,6 +50,20 @@ class ImportDropWidget(QWidget):
             self.ai_callback(file_path)
         elif self.callback:
             self.callback(file_path)
+
+
+class _GlobalUIKeyFilter(QObject):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+
+    def eventFilter(self, obj, event):
+        owner = self.owner
+        if owner is None or event is None:
+            return False
+        if event.type() == QEvent.Type.KeyPress:
+            return bool(owner.handle_global_ui_key_press(event))
+        return False
 
 from search_modules.infrastructure import build_highlighted_text_html
 from search_modules.ai_prompts import default_ai_prompts, loads_prompts
@@ -832,7 +847,230 @@ class UIMixin:
         self.apply_styles()
         if hasattr(self, 'setup_ai_chat_shortcuts'):
             self.setup_ai_chat_shortcuts()
+        self.setup_global_ui_shortcuts()
         self.init_study_timer()
+
+    def get_default_button_shortcuts(self):
+        return {
+            "settings_btn": "Alt+S",
+            "add_folder_btn": "Alt+N",
+            "delete_folder_btn": "Alt+D",
+            "import_btn": "Alt+I",
+            "import_ai_btn": "Alt+A",
+            "export_btn_ui": "Alt+O",
+            "doc_new_btn": "Alt+M",
+            "doc_import_btn": "Alt+P",
+            "doc_save_btn": "Alt+V",
+            "doc_delete_btn": "Alt+X",
+            "doc_annotations_btn": "Alt+G",
+            "inner_tool_action_1": "Alt+1",
+            "inner_tool_action_2": "Alt+2",
+            "inner_confirm_btn": "Alt+C",
+        }
+
+    def setup_global_ui_shortcuts(self):
+        if getattr(self, "_global_ui_shortcuts_ready", False):
+            return
+        self._shortcut_button_order = [
+            "settings_btn",
+            "add_folder_btn",
+            "delete_folder_btn",
+            "import_btn",
+            "import_ai_btn",
+            "export_btn_ui",
+            "doc_new_btn",
+            "doc_import_btn",
+            "doc_save_btn",
+            "doc_delete_btn",
+            "doc_annotations_btn",
+            "inner_tool_action_1",
+            "inner_tool_action_2",
+            "inner_confirm_btn",
+        ]
+        self._shortcut_buttons = {}
+        for attr in self._shortcut_button_order:
+            btn = getattr(self, attr, None)
+            if isinstance(btn, QPushButton):
+                if not btn.objectName():
+                    btn.setObjectName(attr)
+                self._shortcut_buttons[attr] = btn
+        self._button_shortcut_hints_visible = False
+        self._button_shortcut_hint_labels = []
+        self._button_shortcuts = self.load_button_shortcuts()
+        self.apply_button_shortcuts()
+
+        self.shortcut_toggle_hints = QShortcut(QKeySequence("Shift+E"), self)
+        self.shortcut_toggle_hints.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.shortcut_toggle_hints.activated.connect(self.toggle_button_shortcut_hints)
+
+        self.shortcut_edit_hints = QShortcut(QKeySequence("Shift+R"), self)
+        self.shortcut_edit_hints.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.shortcut_edit_hints.activated.connect(self.open_button_shortcut_editor)
+
+        app = QApplication.instance()
+        if app is not None:
+            self._global_ui_key_filter = _GlobalUIKeyFilter(self)
+            app.installEventFilter(self._global_ui_key_filter)
+        self._global_ui_shortcuts_ready = True
+
+    def load_button_shortcuts(self):
+        defaults = self.get_default_button_shortcuts()
+        merged = dict(defaults)
+        raw = self.settings.get("button_shortcuts_json", "") if hasattr(self, "settings") else ""
+        user_obj = {}
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    user_obj = parsed
+            except Exception:
+                user_obj = {}
+        for key, val in user_obj.items():
+            if key in merged and isinstance(val, str):
+                seq = QKeySequence(val.strip())
+                text = seq.toString(QKeySequence.SequenceFormat.PortableText).strip()
+                merged[key] = text
+        serialized = json.dumps(merged, ensure_ascii=False)
+        if hasattr(self, "settings"):
+            if self.settings.get("button_shortcuts_json", "") != serialized:
+                self.set_setting("button_shortcuts_json", serialized)
+                self.settings["button_shortcuts_json"] = serialized
+        return merged
+
+    def apply_button_shortcuts(self):
+        for attr, btn in self._shortcut_buttons.items():
+            key_text = (self._button_shortcuts.get(attr, "") or "").strip()
+            if key_text:
+                btn.setShortcut(QKeySequence(key_text))
+            else:
+                btn.setShortcut(QKeySequence())
+
+    def toggle_button_shortcut_hints(self):
+        if getattr(self, "_button_shortcut_hints_visible", False):
+            self.hide_button_shortcut_hints()
+        else:
+            self.show_button_shortcut_hints()
+
+    def show_button_shortcut_hints(self):
+        self.hide_button_shortcut_hints()
+        hints = []
+        for attr in self._shortcut_button_order:
+            btn = self._shortcut_buttons.get(attr)
+            if btn is None or not btn.isVisible():
+                continue
+            key_text = (self._button_shortcuts.get(attr, "") or "").strip()
+            if not key_text:
+                continue
+            label = QLabel(key_text, btn)
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            label.setStyleSheet(
+                "QLabel{background-color:#f1c40f;color:#111111;border:1px solid #b38f00;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700;}"
+            )
+            label.adjustSize()
+            x = max(0, (btn.width() - label.width()) // 2)
+            y = 2
+            label.move(x, y)
+            label.show()
+            label.raise_()
+            hints.append(label)
+        self._button_shortcut_hint_labels = hints
+        self._button_shortcut_hints_visible = True
+
+    def hide_button_shortcut_hints(self):
+        for label in getattr(self, "_button_shortcut_hint_labels", []):
+            try:
+                label.hide()
+                label.deleteLater()
+            except Exception:
+                pass
+        self._button_shortcut_hint_labels = []
+        self._button_shortcut_hints_visible = False
+
+    def open_button_shortcut_editor(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("快捷键设置")
+        dlg.resize(580, 560)
+        layout = QVBoxLayout()
+        dlg.setLayout(layout)
+        tip = QLabel("设置每个按钮的快捷键（Shift+E 显示，Shift+R 可再次修改）。")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        form = QFormLayout()
+        editors = {}
+        for attr in self._shortcut_button_order:
+            btn = self._shortcut_buttons.get(attr)
+            if btn is None:
+                continue
+            editor = QKeySequenceEdit(dlg)
+            editor.setKeySequence(QKeySequence((self._button_shortcuts.get(attr, "") or "").strip()))
+            label_text = (btn.text() or attr).replace("\n", " ").strip()
+            form.addRow(label_text, editor)
+            editors[attr] = editor
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updated = dict(self._button_shortcuts)
+        used = {}
+        for attr in self._shortcut_button_order:
+            editor = editors.get(attr)
+            if editor is None:
+                continue
+            key_text = editor.keySequence().toString(QKeySequence.SequenceFormat.PortableText).strip()
+            if key_text:
+                low = key_text.lower()
+                if low in used and used[low] != attr:
+                    QMessageBox.warning(self, "快捷键冲突", f"“{key_text}”重复，请改成不冲突的快捷键。")
+                    return
+                used[low] = attr
+            updated[attr] = key_text
+
+        self._button_shortcuts = updated
+        serialized = json.dumps(updated, ensure_ascii=False)
+        self.set_setting("button_shortcuts_json", serialized)
+        self.settings["button_shortcuts_json"] = serialized
+        self.apply_button_shortcuts()
+        if self._button_shortcut_hints_visible:
+            self.show_button_shortcut_hints()
+
+    def handle_global_ui_key_press(self, event):
+        if event is None:
+            return False
+        return self.route_typing_to_search_input(event)
+
+    def route_typing_to_search_input(self, event):
+        if not hasattr(self, "main_tabs") or not hasattr(self, "search_input"):
+            return False
+        if self.main_tabs.currentIndex() != 0:
+            return False
+        mods = event.modifiers()
+        if mods & (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        ):
+            return False
+        focus = QApplication.focusWidget()
+        if focus is not None:
+            if (
+                focus.inherits("QLineEdit")
+                or focus.inherits("QTextEdit")
+                or focus.inherits("QPlainTextEdit")
+                or focus.inherits("QTextBrowser")
+                or focus.inherits("QComboBox")
+                or focus.inherits("QAbstractSpinBox")
+            ):
+                return False
+        text = event.text() or ""
+        if len(text) != 1 or (not text.isascii()) or (not text.isalpha()):
+            return False
+        self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_input.insert(text)
+        return True
 
     def on_main_tab_changed(self, index):
         if hasattr(self, 'main_tabs'):
