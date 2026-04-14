@@ -850,8 +850,17 @@ class UIMixin:
         self.setup_global_ui_shortcuts()
         self.init_study_timer()
 
+    def get_shortcut_pool(self):
+        pool = []
+        for mod in ("Alt", "Ctrl+Alt"):
+            for key in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"):
+                pool.append(f"{mod}+{key}")
+            for key in "QWERTYUIOPASDFGHJKLZXCVBNM":
+                pool.append(f"{mod}+{key}")
+        return pool
+
     def get_default_button_shortcuts(self):
-        return {
+        preferred = {
             "settings_btn": "Alt+S",
             "add_folder_btn": "Alt+N",
             "delete_folder_btn": "Alt+D",
@@ -867,33 +876,53 @@ class UIMixin:
             "inner_tool_action_2": "Alt+2",
             "inner_confirm_btn": "Alt+C",
         }
+        defaults = {}
+        used = set()
+        for attr in self._shortcut_button_order:
+            seq = preferred.get(attr, "")
+            if seq:
+                low = seq.lower()
+                if low not in used:
+                    defaults[attr] = seq
+                    used.add(low)
+        pool = self.get_shortcut_pool()
+        for attr in self._shortcut_button_order:
+            if attr in defaults:
+                continue
+            chosen = ""
+            for seq in pool:
+                low = seq.lower()
+                if low not in used:
+                    chosen = seq
+                    used.add(low)
+                    break
+            defaults[attr] = chosen
+        return defaults
+
+    def collect_shortcut_buttons(self):
+        buttons = {}
+        order = []
+        auto_idx = 1
+        for btn in self.findChildren(QPushButton):
+            name = (btn.objectName() or "").strip()
+            if not name:
+                while True:
+                    candidate = f"auto_btn_{auto_idx}"
+                    auto_idx += 1
+                    if candidate not in buttons:
+                        name = candidate
+                        break
+                btn.setObjectName(name)
+            if name in buttons:
+                continue
+            buttons[name] = btn
+            order.append(name)
+        return buttons, order
 
     def setup_global_ui_shortcuts(self):
         if getattr(self, "_global_ui_shortcuts_ready", False):
             return
-        self._shortcut_button_order = [
-            "settings_btn",
-            "add_folder_btn",
-            "delete_folder_btn",
-            "import_btn",
-            "import_ai_btn",
-            "export_btn_ui",
-            "doc_new_btn",
-            "doc_import_btn",
-            "doc_save_btn",
-            "doc_delete_btn",
-            "doc_annotations_btn",
-            "inner_tool_action_1",
-            "inner_tool_action_2",
-            "inner_confirm_btn",
-        ]
-        self._shortcut_buttons = {}
-        for attr in self._shortcut_button_order:
-            btn = getattr(self, attr, None)
-            if isinstance(btn, QPushButton):
-                if not btn.objectName():
-                    btn.setObjectName(attr)
-                self._shortcut_buttons[attr] = btn
+        self._shortcut_buttons, self._shortcut_button_order = self.collect_shortcut_buttons()
         self._button_shortcut_hints_visible = False
         self._button_shortcut_hint_labels = []
         self._button_shortcuts = self.load_button_shortcuts()
@@ -1052,6 +1081,7 @@ class UIMixin:
             Qt.KeyboardModifier.ControlModifier
             | Qt.KeyboardModifier.AltModifier
             | Qt.KeyboardModifier.MetaModifier
+            | Qt.KeyboardModifier.ShiftModifier
         ):
             return False
         focus = QApplication.focusWidget()
@@ -1106,6 +1136,8 @@ class UIMixin:
                 anim.start()
         if index == 1:
             self.refresh_internal_page()
+        if getattr(self, "_button_shortcut_hints_visible", False):
+            self.show_button_shortcut_hints()
 
     def set_dark_theme(self):
         palette = QPalette()
