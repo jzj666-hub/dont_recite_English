@@ -196,6 +196,9 @@ class InfrastructureMixin:
         return text
 
     def extract_words_from_ai_result(self, text):
+        links = self.extract_word_links_from_ai_result(text)
+        if links:
+            return [item.get("word", "") for item in links if (item.get("word", "") or "").strip()]
         raw = (text or "").strip()
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
@@ -220,6 +223,55 @@ class InfrastructureMixin:
                 continue
             seen.add(token)
             normalized.append(token)
+        return normalized
+
+    def normalize_word_link_type(self, raw_tag):
+        token = (raw_tag or "").strip().lower()
+        if token in ("近义词", "同义词", "synonym", "synonyms"):
+            return "近义词"
+        if token in ("反义词", "antonym", "antonyms"):
+            return "反义词"
+        if token in ("形近词", "形似词", "易混词", "look-alike", "lookalike"):
+            return "形近词"
+        return "近义词"
+
+    def extract_word_links_from_ai_result(self, text):
+        raw = (text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+        candidate_items = []
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                if isinstance(obj.get("links"), list):
+                    candidate_items = obj.get("links", [])
+                elif isinstance(obj.get("words"), list):
+                    candidate_items = obj.get("words", [])
+        except Exception:
+            pass
+        if not candidate_items:
+            candidate_items = re.findall(r"[A-Za-z][A-Za-z\-']*", raw)
+
+        normalized = []
+        seen = set()
+        for item in candidate_items:
+            word = ""
+            tag = ""
+            if isinstance(item, dict):
+                word = str(item.get("word", "")).strip()
+                tag = str(item.get("tag", "")).strip()
+            else:
+                word = str(item).strip()
+            token = word.lower()
+            if not token:
+                continue
+            if not re.fullmatch(r"[A-Za-z][A-Za-z\-']*", token):
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            normalized.append({"word": token, "tag": self.normalize_word_link_type(tag)})
         return normalized
 
     def get_mid_model_name(self):

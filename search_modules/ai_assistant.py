@@ -4,6 +4,7 @@ import threading
 from datetime import datetime
 from urllib import error, request
 
+from PyQt6 import sip
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtGui import QTextDocument
@@ -45,7 +46,14 @@ class AIChatWindow(QDialog):
         except Exception:
             prompts = default_ai_prompts()
         self.messages = [
-            {"role": "system", "content": prompt_text(prompts, "chat_system", "你是英语学习助手。回答需要准确、清晰、结合上下文。")}
+            {
+                "role": "system",
+                "content": prompt_text(
+                    prompts,
+                    "chat_system",
+                    "你是资深英语老师型助手。默认用连贯段落回答，避免分点与空话，逻辑自洽、务实清晰。",
+                ),
+            }
         ]
         self.chat_blocks = []
         self.pending_assistant_text = ""
@@ -260,7 +268,9 @@ class AIAssistantMixin:
         dlg.activateWindow()
 
     def _cleanup_ai_chat_windows(self):
-        self.ai_chat_windows = [w for w in self.ai_chat_windows if w is not None and w.isVisible()]
+        self.ai_chat_windows = [
+            w for w in self.ai_chat_windows if w is not None and not sip.isdeleted(w) and w.isVisible()
+        ]
 
     def install_ai_selection_context_menu(self, text_widget, source_name):
         text_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -477,8 +487,8 @@ class AIAssistantMixin:
         }
         try:
             text = (self.request_ai_stream_text(url, key, payload, timeout=60) or "").strip()
-            words = self.extract_words_from_ai_result(text)
-            self.ai_links_ready.emit({"ok": True, "words": words, "current_word": current_word})
+            links = self.extract_word_links_from_ai_result(text)
+            self.ai_links_ready.emit({"ok": True, "links": links, "current_word": current_word})
         except Exception as e:
             self.ai_links_ready.emit({"ok": False, "error": str(e), "current_word": current_word})
 
@@ -490,16 +500,26 @@ class AIAssistantMixin:
             QMessageBox.warning(self, "推荐失败", f"AI 推荐关联词失败：{err}")
             return
         current_word = result.get("current_word", "")
-        suggestions = result.get("words", [])
+        suggestions = result.get("links", [])
         valid = []
-        for token in suggestions:
+        seen = set()
+        for item in suggestions:
+            if isinstance(item, dict):
+                token = str(item.get("word", "")).strip()
+                tag = self.normalize_word_link_type(item.get("tag", ""))
+            else:
+                token = str(item).strip()
+                tag = "近义词"
             found = self.lookup_dictionary_word_exact(token)
             if not found:
                 continue
             if found.lower() == current_word.lower():
                 continue
-            if found.lower() not in [x.lower() for x in valid]:
-                valid.append(found)
+            key = found.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            valid.append({"word": found, "tag": tag})
         if not valid:
             QMessageBox.information(self, "推荐结果", "未找到可添加的关联词（可能不在词库里）。")
             return
@@ -509,8 +529,11 @@ class AIAssistantMixin:
         tip = QLabel(f"原词：{current_word}\n请选择要添加的关联词：")
         layout.addWidget(tip)
         list_widget = QListWidget()
-        for w in valid:
-            item = QListWidgetItem(w)
+        for row in valid:
+            word = row.get("word", "")
+            tag = row.get("tag", "近义词")
+            item = QListWidgetItem(f"[{tag}] {word}")
+            item.setData(Qt.ItemDataRole.UserRole, {"word": word, "tag": tag})
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
             list_widget.addItem(item)
@@ -526,7 +549,12 @@ class AIAssistantMixin:
             for i in range(list_widget.count()):
                 item = list_widget.item(i)
                 if item.checkState() == Qt.CheckState.Checked:
-                    self.add_word_link(current_word, item.text())
+                    payload = item.data(Qt.ItemDataRole.UserRole) or {}
+                    word = str(payload.get("word", "")).strip()
+                    tag = self.normalize_word_link_type(payload.get("tag", ""))
+                    if not word:
+                        continue
+                    self.add_word_link(current_word, word, link_type=tag)
                     added += 1
             self.refresh_words_link_view(current_word)
             QMessageBox.information(self, "已完成", f"已添加 {added} 个关联词。")
@@ -542,9 +570,9 @@ class AIAssistantMixin:
         self.ai_options_list.setStyleSheet(self.ai_options_list.styleSheet() + "\nQListWidget{border:none;background:transparent;}")
         is_cn = self.contains_chinese(self.current_query)
         if is_cn:
-            options = ["查询相关单词", "查询相关固定搭配或短语", "查询英语语境下的该中文表达转化", "自然解释", "AI助记"]
+            options = ["查询相关单词", "查询相关固定搭配或短语", "查询英语语境下的该中文表达转化", "自然解释", "生僻意解读", "c.f.（近义词用法辨析）", "AI助记"]
         else:
-            options = ["自然解释", "相关短语列举", "固定搭配列举", "词汇变形", "英语语境词语用法", "例句用法", "AI助记", "找近义词", "找反义词"]
+            options = ["自然解释", "生僻意解读", "c.f.（近义词用法辨析）", "相关短语列举", "固定搭配列举", "词汇变形", "英语语境词语用法", "例句用法", "AI助记", "找近义词", "找反义词"]
         
         for t in options:
             item = QListWidgetItem(t)
@@ -577,6 +605,9 @@ class AIAssistantMixin:
             self.append_ai_to_note_bottom("\n\nAI 配置不完整：请先在设置中配置 API URL、API Key 和模型名\n")
             return
         prompt = self.build_ai_prompt(self.current_query, selections, free_q)
+        current_note = self.note_edit.toPlainText() if hasattr(self, "note_edit") else ""
+        self.ai_note_stream_first_chunk = True
+        self.ai_note_need_separator = bool((current_note or "").strip())
         self.ai_generate_btn.setEnabled(False)
         if hasattr(self, 'detail_tab_widget'):
             self.detail_tab_widget.setCurrentIndex(1)
@@ -599,6 +630,10 @@ class AIAssistantMixin:
         else:
             default_opt = "查询相关单词" if is_cn else "自然解释"
             parts.append(f"- {default_opt}：{self.get_ai_option_instruction(default_opt)}")
+        if "例句用法" in selections:
+            exam_level_hint = self.get_ai_example_exam_level_hint()
+            if exam_level_hint:
+                parts.append(exam_level_hint)
         
         if free_q:
             parts.append(f"自由提问：{free_q}")
@@ -606,12 +641,20 @@ class AIAssistantMixin:
         parts.append("输出约束：每段尽量短，信息完整，不重复。")
         return "\n".join(parts)
 
+    def get_ai_example_exam_level_hint(self):
+        level = (self.settings.get("ai_example_exam_level", "不限") or "").strip()
+        if not level or level == "不限":
+            return ""
+        return f"例句难度要求：请将“例句用法”整体控制在【{level}】备考水平附近，并兼顾真实语境。"
+
     def get_ai_option_instruction(self, option):
         instructions = {
             "查询相关单词": "列出与该中文意思相关的5-8个核心英语单词，标注词性并附带简短中文义。",
             "查询相关固定搭配或短语": "列出与该中文词义关联度最高的4-6个英语短语或固定搭配，并各给一个地道例句。",
             "查询英语语境下的该中文表达转化": "说明该中文在口语、写作、商务等不同英语场景下的地道对应表达，并给出典型句型。",
             "自然解释": "解释该词项的核心含义与用法（针对中文搜索，重点解释其对应的英文语感差异），并给出一句最自然的英文例句。",
+            "生僻意解读": "优先挖掘该词/短语不常见但真实可用的含义与语境，给出触发条件、常见误解，并配2-3条高质量例句（含中译）。",
+            "c.f.（近义词用法辨析）": "列出4-6个相关近义词，重点说明各自“更适合”的语境、语气和搭配差异；强调它们常有互通与重叠，不要把边界说成绝对，只讲常见倾向而非唯一规则，并给对比例句。",
             "相关短语列举": "列出4-8个高频相关短语，每个短语给中文义和1个简短例句。",
             "固定搭配列举": "列出最常用固定搭配（动词/介词/名词搭配），按“搭配+中文义+例句”格式输出。",
             "词汇变形": "给出词性与常见变形（时态、复数、比较级等），并说明每种变形最常见用法。",
@@ -628,7 +671,7 @@ class AIAssistantMixin:
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You are a helpful English learning assistant for Chinese users."},
+                    {"role": "system", "content": prompt_text(self.get_ai_prompts(), "note_ai_system", "You are a helpful English learning assistant for Chinese users.")},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.2,
@@ -688,9 +731,20 @@ class AIAssistantMixin:
         self.note_edit.verticalScrollBar().setValue(self.note_edit.verticalScrollBar().maximum())
 
     def _append_ai_chunk_to_note(self, chunk):
+        if getattr(self, "ai_note_stream_first_chunk", False):
+            self.ai_note_stream_first_chunk = False
+            if getattr(self, "ai_note_need_separator", False):
+                sep = "\n\n──────────\n"
+                current = self.note_edit.toPlainText() if hasattr(self, "note_edit") else ""
+                if current and not current.endswith("\n"):
+                    sep = "\n" + sep
+                self.append_ai_to_note_bottom(sep)
+                self.ai_note_need_separator = False
         self.append_ai_to_note_bottom(chunk)
 
     def _finish_ai_generation(self):
+        self.ai_note_stream_first_chunk = False
+        self.ai_note_need_separator = False
         if hasattr(self, 'ai_generate_btn'):
             self.ai_generate_btn.setEnabled(True)
         if hasattr(self, 'detail_tab_widget'):

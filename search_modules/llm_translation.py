@@ -21,8 +21,9 @@ class LLMTranslationMixin:
             if isinstance(k, str) and isinstance(v, str) and k.strip():
                 merged[k.strip()] = v
         return merged
-    def prepare_llm_translate_context(self, target_text, is_word, restore_kind):
+    def prepare_llm_translate_context(self, target_text, is_word, restore_kind, original_meaning=""):
         self.llm_target_text = target_text
+        self.llm_target_original_meaning = re.sub(r"\s+", " ", (original_meaning or "")).strip()
         self.llm_target_is_word = bool(is_word)
         self.llm_restore_kind = restore_kind
         self.llm_restore_query = self.current_query
@@ -33,10 +34,17 @@ class LLMTranslationMixin:
     def show_cached_llm_translation_if_exists(self):
         if not hasattr(self, 'llm_cache_store'):
             return
-        cached_html = self.llm_cache_store.get_cached_html(self.llm_target_text, self.llm_restore_kind)
+        cached_html = self.llm_cache_store.get_cached_html(self._llm_cache_query_key(), self.llm_restore_kind)
         if cached_html:
             self.llm_last_response_text = ""
             self.show_llm_translation_in_place(cached_html)
+
+    def _llm_cache_query_key(self):
+        base = (self.llm_target_text or "").strip()
+        original = (getattr(self, "llm_target_original_meaning", "") or "").strip()
+        if not original:
+            return base
+        return f"{base} ||orig:{original[:300]}"
 
     def build_llm_translation_area(self):
         title = QLabel("LLM 补充翻译")
@@ -96,18 +104,23 @@ class LLMTranslationMixin:
         request_seq = self.llm_translate_request_seq
         loading_html = f"<div style='color:#98c379;'>正在使用{html.escape(model_level)}模型翻译...</div>"
         self.show_llm_translation_in_place(loading_html)
-        prompt = self.build_llm_translate_prompt(self.llm_target_text, self.llm_target_is_word)
+        prompt = self.build_llm_translate_prompt(
+            self.llm_target_text,
+            self.llm_target_is_word,
+            getattr(self, "llm_target_original_meaning", ""),
+        )
         threading.Thread(target=self._llm_translate_worker, args=(url, key, model, model_level, prompt, request_seq), daemon=True).start()
 
-    def build_llm_translate_prompt(self, text, is_word):
-        meaning_rule = "字符串数组，按词性与语义分组，尽可能覆盖常见义项、引申义与高频短语义，至少 4 条。"
+    def build_llm_translate_prompt(self, text, is_word, original_meaning=""):
+        meaning_rule = "字符串数组，基于“原始中文释义”做查漏补缺；保留原释义核心，仅补充缺失义项/语境/易混差异，不要整段重译。"
         if not is_word:
-            meaning_rule = "字符串，给出整句自然中文翻译，可补充一句语气/语境说明。"
+            meaning_rule = "字符串，基于“原始中文释义”做润色与补足，优先修正遗漏点，不要完全重写。"
         tmpl = prompt_text(self.get_ai_prompts(), "llm_translate_prompt", "")
         return (tmpl or "").format(
             meaning_rule=meaning_rule,
             kind=("单词" if is_word else "句子"),
             text=text,
+            original_meaning=(original_meaning or "（无）"),
         )
 
     def format_llm_translate_output(self, text):
@@ -125,6 +138,10 @@ class LLMTranslationMixin:
                 meaning_items = [str(x).strip() for x in meaning if str(x).strip()]
             else:
                 meaning_items = [str(meaning).strip()] if str(meaning).strip() else []
+            meaning_items = self.filter_incremental_meanings(
+                meaning_items,
+                getattr(self, "llm_target_original_meaning", ""),
+            )
             if not isinstance(examples, list):
                 examples = [str(examples)]
             if not isinstance(usages, list):
@@ -139,6 +156,27 @@ class LLMTranslationMixin:
             )
         except Exception:
             return f"<div><b>释义</b><div style='margin-top:4px;margin-bottom:8px;'>{self.highlight_llm_text(raw)}</div></div>"
+
+    def normalize_compare_text(self, text):
+        token = re.sub(r"\s+", "", str(text or "").lower())
+        token = re.sub(r"[，。；：、“”‘’（）()【】\\[\\],.;:!?/\\\\'\"`~\-]+", "", token)
+        return token
+
+    def filter_incremental_meanings(self, meaning_items, original_meaning):
+        original = self.normalize_compare_text(original_meaning)
+        if not original:
+            return meaning_items
+        out = []
+        for item in meaning_items:
+            cur = self.normalize_compare_text(item)
+            if not cur:
+                continue
+            if cur == "无新增":
+                continue
+            if cur in original or original in cur:
+                continue
+            out.append(item)
+        return out or ["无新增"]
 
     def highlight_llm_text(self, raw_text):
         plain = str(raw_text or "")
@@ -261,4 +299,4 @@ class LLMTranslationMixin:
         html_text = self.format_llm_translate_output(text)
         self.show_llm_translation_in_place(html_text)
         if (result or {}).get("ok") and (result or {}).get("done", True):
-            self.llm_cache_store.save_cached_html(self.llm_target_text, self.llm_restore_kind, html_text)
+            self.llm_cache_store.save_cached_html(self._llm_cache_query_key(), self.llm_restore_kind, html_text)

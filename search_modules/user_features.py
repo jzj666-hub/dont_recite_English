@@ -2816,11 +2816,16 @@ class UserFeaturesMixin:
             return left_word, right_word
         return right_word, left_word
 
-    def add_word_link(self, current_word, linked_word):
+    def add_word_link(self, current_word, linked_word, link_type="近义词"):
         word_a, word_b = self.normalize_link_pair(current_word, linked_word)
+        tag = self.normalize_word_link_type(link_type)
         ts = datetime.now().isoformat(timespec='seconds')
         cur = self.user_conn.cursor()
-        cur.execute('INSERT OR IGNORE INTO word_links(word_a, word_b, created_at) VALUES(?, ?, ?)', (word_a, word_b, ts))
+        cur.execute(
+            "INSERT INTO word_links(word_a, word_b, link_type, created_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(word_a, word_b) DO UPDATE SET link_type = excluded.link_type, created_at = excluded.created_at",
+            (word_a, word_b, tag, ts),
+        )
         self.user_conn.commit()
 
     def delete_word_link(self, current_word, linked_word):
@@ -2831,17 +2836,23 @@ class UserFeaturesMixin:
 
     def get_word_links(self, current_word):
         cur = self.user_conn.cursor()
-        cur.execute('SELECT word_a, word_b FROM word_links WHERE word_a = ? COLLATE NOCASE OR word_b = ? COLLATE NOCASE ORDER BY id DESC', (current_word, current_word))
+        cur.execute(
+            "SELECT word_a, word_b, COALESCE(link_type, '近义词') "
+            "FROM word_links "
+            "WHERE word_a = ? COLLATE NOCASE OR word_b = ? COLLATE NOCASE "
+            "ORDER BY id DESC",
+            (current_word, current_word),
+        )
         links = []
         seen = set()
-        for a, b in cur.fetchall():
+        for a, b, link_type in cur.fetchall():
             linked = b if a.lower() == current_word.lower() else a
             key = linked.lower()
             if key in seen:
                 continue
             seen.add(key)
-            links.append(linked)
-        links.sort(key=lambda x: x.lower())
+            links.append({"word": linked, "type": self.normalize_word_link_type(link_type)})
+        links.sort(key=lambda x: x.get("word", "").lower())
         return links
 
     def build_words_link_section(self, word):
@@ -2856,6 +2867,9 @@ class UserFeaturesMixin:
         self.word_link_input = QLineEdit()
         self.word_link_input.setPlaceholderText("输入要关联的词")
         add_layout.addWidget(self.word_link_input)
+        self.word_link_type_combo = QComboBox()
+        self.word_link_type_combo.addItems(["近义词", "反义词", "形近词"])
+        add_layout.addWidget(self.word_link_type_combo)
         add_btn = QPushButton("添加关联")
         add_btn.clicked.connect(self.on_add_word_link_clicked)
         add_layout.addWidget(add_btn)
@@ -2867,6 +2881,11 @@ class UserFeaturesMixin:
         self.word_links_browser.setOpenLinks(False)
         self.word_links_browser.setOpenExternalLinks(False)
         self.word_links_browser.anchorClicked.connect(self.on_word_link_clicked)
+        hover_signal = getattr(self.word_links_browser, "anchorHovered", None)
+        if hover_signal is not None:
+            hover_signal.connect(self.on_word_link_hovered)
+        else:
+            self.word_links_browser.highlighted.connect(self.on_word_link_hovered)
         self.word_links_browser.setMinimumHeight(120)
         self.word_links_browser.setMaximumHeight(220)
         self.word_links_browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -2881,7 +2900,9 @@ class UserFeaturesMixin:
             self.word_links_browser.setHtml("<div style='color:#888;'>暂无关联词，可手动添加。</div>")
             return
         rows = []
-        for linked_word in links:
+        for row in links:
+            linked_word = row.get("word", "")
+            link_type = self.normalize_word_link_type(row.get("type", ""))
             token = html.escape(linked_word)
             go_href = html.escape(f"go:{quote(linked_word, safe='')}", quote=True)
             del_href = html.escape(f"del:{quote(linked_word, safe='')}", quote=True)
@@ -2890,10 +2911,20 @@ class UserFeaturesMixin:
             rows.append(
                 "<tr>"
                 f"<td style='padding:6px;border:1px solid #3d3d3d;'><a href='{go_href}'>{token}</a></td>"
+                f"<td style='padding:6px;border:1px solid #3d3d3d;text-align:center;'>{html.escape(link_type)}</td>"
                 f"<td style='padding:6px;border:1px solid #3d3d3d;text-align:center;'><a href='{del_href}' style='color:#e06c75;'>删除</a></td>"
                 "</tr>"
             )
-        table_html = "<table style='border-collapse:collapse;width:100%;'><tr><th style='text-align:left;padding:6px;border:1px solid #3d3d3d;'>关联词</th><th style='text-align:center;padding:6px;border:1px solid #3d3d3d;'>操作</th></tr>" + "".join(rows) + "</table>"
+        table_html = (
+            "<table style='border-collapse:collapse;width:100%;'>"
+            "<tr>"
+            "<th style='text-align:left;padding:6px;border:1px solid #3d3d3d;'>关联词</th>"
+            "<th style='text-align:center;padding:6px;border:1px solid #3d3d3d;'>标签</th>"
+            "<th style='text-align:center;padding:6px;border:1px solid #3d3d3d;'>操作</th>"
+            "</tr>"
+            + "".join(rows)
+            + "</table>"
+        )
         self.word_links_browser.setHtml(table_html)
 
     def on_add_word_link_clicked(self):
@@ -2911,11 +2942,45 @@ class UserFeaturesMixin:
         if current_word.lower() == target_word.lower():
             QMessageBox.warning(self, "添加关联失败", "不能把一个词关联到自己。")
             return
-        self.add_word_link(current_word, target_word)
+        selected_type = self.normalize_word_link_type(
+            self.word_link_type_combo.currentText() if hasattr(self, "word_link_type_combo") else "近义词"
+        )
+        self.add_word_link(current_word, target_word, link_type=selected_type)
         self.word_link_input.clear()
         self.refresh_words_link_view(current_word)
 
+    def get_word_link_cn_annotation(self, word):
+        token = (word or "").strip()
+        if not token:
+            return ""
+        self.cursor.execute("SELECT translation FROM stardict WHERE word = ? COLLATE NOCASE LIMIT 1", (token,))
+        row = self.cursor.fetchone()
+        text = (row[0] or "").strip() if row else ""
+        text = re.sub(r"\s+", " ", text)
+        if not text:
+            return "暂无中文释义"
+        return text[:120]
+
+    def on_word_link_hovered(self, link):
+        raw = link.toString() if hasattr(link, "toString") else str(link or "")
+        payload = (raw or "").strip()
+        if not payload:
+            QToolTip.hideText()
+            return
+        if payload.startswith("del:"):
+            QToolTip.hideText()
+            return
+        target_payload = payload[3:] if payload.startswith("go:") else payload
+        target = unquote(target_payload).strip().strip("/")
+        if not target:
+            QToolTip.hideText()
+            return
+        resolved = self.lookup_dictionary_word_exact(target) or target
+        text = self.get_word_link_cn_annotation(resolved)
+        QToolTip.showText(QCursor.pos() + QPoint(16, 16), text, self.word_links_browser)
+
     def on_word_link_clicked(self, link_url):
+        QToolTip.hideText()
         raw_target = link_url.toString() if hasattr(link_url, "toString") else str(link_url)
         payload = (raw_target or "").strip()
         if not payload:

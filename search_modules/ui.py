@@ -1112,7 +1112,14 @@ class UIMixin:
             if prev_page is not None and prev_effect is not None and prev_page.graphicsEffect() is prev_effect:
                 prev_page.setGraphicsEffect(None)
             page = self.main_tabs.widget(index)
-            if page is not None:
+            # 溯游页切换时改为同步刷新，避免左下区域和其它模块出现渲染时差。
+            if page is not None and index == 0:
+                self._tab_fade_page = None
+                self._tab_fade_effect = None
+                self._tab_fade_anim = None
+                page.setGraphicsEffect(None)
+                self.force_sync_extension_render()
+            elif page is not None:
                 effect = QGraphicsOpacityEffect(page)
                 page.setGraphicsEffect(effect)
                 effect.setOpacity(0.0)
@@ -1138,6 +1145,22 @@ class UIMixin:
             self.refresh_internal_page()
         if getattr(self, "_button_shortcut_hints_visible", False):
             self.show_button_shortcut_hints()
+
+    def force_sync_extension_render(self):
+        widgets = [
+            getattr(self.main_tabs, "currentWidget", lambda: None)(),
+            getattr(self, "search_input", None),
+            getattr(self, "candidates_list", None),
+            getattr(self, "detail_tab_widget", None),
+            getattr(self, "favorites_list", None),
+        ]
+        for w in widgets:
+            if w is None:
+                continue
+            w.updateGeometry()
+            w.update()
+            w.repaint()
+        QApplication.processEvents()
 
     def set_dark_theme(self):
         palette = QPalette()
@@ -1376,6 +1399,14 @@ class UIMixin:
         model_mid_edit.setText(self.get_mid_model_name())
         model_high_edit = QLineEdit()
         model_high_edit.setText(self.get_high_model_name())
+        ai_exam_level_combo = QComboBox()
+        ai_exam_level_options = ["不限", "初中", "高中", "高考", "CET-4", "CET-6", "考研", "IELTS", "TOEFL", "GRE", "专八"]
+        current_ai_exam_level = (self.settings.get("ai_example_exam_level", "不限") or "").strip() or "不限"
+        for token in ai_exam_level_options:
+            ai_exam_level_combo.addItem(token)
+        idx = ai_exam_level_combo.findText(current_ai_exam_level)
+        if idx >= 0:
+            ai_exam_level_combo.setCurrentIndex(idx)
         
         # TTS 英文设置
         tts_en_voices = [
@@ -1467,9 +1498,12 @@ class UIMixin:
         
         # 获取当前提示词设置
         try:
-            current_prompts = loads_prompts(self.settings.get("ai_prompts_json", "")) if hasattr(self, "settings") else {}
-            if not current_prompts:
-                current_prompts = default_ai_prompts()
+            default_prompts = default_ai_prompts()
+            user_prompts = loads_prompts(self.settings.get("ai_prompts_json", "")) if hasattr(self, "settings") else {}
+            current_prompts = dict(default_prompts)
+            for k, v in (user_prompts or {}).items():
+                if isinstance(k, str) and k.strip():
+                    current_prompts[k.strip()] = v
         except Exception:
             current_prompts = default_ai_prompts()
         
@@ -1478,11 +1512,13 @@ class UIMixin:
             "通用设置": ["chat_system", "json_system", "translator_system", "note_ai_system"],
             "词条页AI服务": ["detail_ai_header", "detail_ai_tail"],
             "右键语境提问": ["selection_answer_rules"],
+            "选词成文": ["wordcraft_generate_prompt", "wordcraft_generation_system", "wordcraft_review_prompt", "wordcraft_explain_system", "wordcraft_explain_prompt", "wordcraft_annotation_prompt"],
             "AI收藏夹推荐": ["smart_favorite_prompt"],
             "AI关联词推荐": ["suggest_links_prompt"],
             "LLM补充翻译": ["llm_translate_prompt"],
-            "随机考词": ["quiz_hint_prompt", "quiz_grade_prompt"],
+            "随机考词": ["quiz_hint_prompt", "quiz_context_rewrite_prompt", "quiz_grade_prompt", "quiz_summary_system", "quiz_summary_prompt"],
             "文档解读": ["doc_reader_explain_prompt"],
+            "AI智能导入": ["ai_import_extract_system", "ai_import_extract_prompt"],
         }
         
         # 创建每个分类的标签页
@@ -1577,8 +1613,12 @@ class UIMixin:
                 json_text = ai_prompts_json_edit.toPlainText().strip()
                 if json_text:
                     parsed = json.loads(json_text)
+                    merged = dict(default_ai_prompts())
+                    for k, v in (parsed or {}).items():
+                        if isinstance(k, str) and k.strip():
+                            merged[k.strip()] = v
                     for key, edit in all_prompt_edits.items():
-                        prompt_data = parsed.get(key, {})
+                        prompt_data = merged.get(key, {})
                         if isinstance(prompt_data, str):
                             edit.setPlainText(prompt_data)
                         else:
@@ -1614,6 +1654,7 @@ class UIMixin:
             api_key_edit.setStyleSheet(input_style)
             model_mid_edit.setStyleSheet(input_style)
             model_high_edit.setStyleSheet(input_style)
+            ai_exam_level_combo.setStyleSheet(input_style)
             tts_voice_combo.setStyleSheet(input_style)
             tts_voice_cn_combo.setStyleSheet(input_style)
             self.export_source_combo.setStyleSheet(input_style)
@@ -1655,6 +1696,7 @@ class UIMixin:
         form.addRow("API Key", api_key_edit)
         form.addRow("中级模型名", model_mid_edit)
         form.addRow("高级模型名", model_high_edit)
+        form.addRow("AI例句备考等级", ai_exam_level_combo)
         form.addRow("TTS 语音 (英文)", tts_voice_combo)
         form.addRow("TTS 语速 (英文)", tts_rate_container)
         form.addRow("TTS 语音 (中文)", tts_voice_cn_combo)
@@ -1692,6 +1734,7 @@ class UIMixin:
             high_model = model_high_edit.text().strip()
             self.set_setting('model_high', high_model)
             self.set_setting('model', high_model)
+            self.set_setting('ai_example_exam_level', ai_exam_level_combo.currentText().strip() or '不限')
             self.set_setting('tts_voice', tts_voice_combo.currentData())
             rate_val = tts_rate_slider.value()
             self.set_setting('tts_rate', f"{'+' if rate_val >= 0 else ''}{rate_val}%")
@@ -1797,11 +1840,13 @@ class UIMixin:
             "通用设置": "这些是基础的系统提示词，影响AI在所有功能中的基本行为。包括聊天角色定义、JSON输出要求、翻译风格等。",
             "词条页AI服务": "控制词条详情页中AI服务的提示词，包括AI批注生成、词条解释等功能的开头和结尾约束。",
             "右键语境提问": "当您在文本中右键选择文字并提问时使用的提示词，控制AI对选中文本的回答风格和内容要求。",
+            "选词成文": "控制“选词成文”的双阶段流程：先生成英文文章草稿，再审查语法/细节并润色，最终输出更连贯、错误更少的结果。",
             "AI收藏夹推荐": "当使用AI智能推荐收藏夹功能时使用的提示词，控制AI如何根据当前词条选择合适的收藏夹。",
             "AI关联词推荐": "AI推荐相关单词功能使用的提示词，控制AI如何选择和推荐与当前单词相关的词汇。",
             "LLM补充翻译": "LLM翻译功能使用的提示词，控制AI如何生成详细的单词释义、例句和常见用法。",
             "随机考词": "随机考词功能中使用的提示词，包括单词提示（轻/中/强提示）和最终评档的规则设置。",
             "文档解读": "析文标签页中，针对框选 Markdown 片段进行 AI 划线注解（流式弹框输出）时使用的提示词。",
+            "AI智能导入": "用于“AI 智能导入”文件解析：先分析文件样本，再生成 extract_words 函数代码。",
         }
         return descriptions.get(category_name, "该分类的详细说明。")
 

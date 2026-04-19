@@ -10,6 +10,7 @@ class BootstrapMixin:
         self.llm_translate_click_count = 0
         self.llm_translate_request_seq = 0
         self.llm_target_text = ""
+        self.llm_target_original_meaning = ""
         self.llm_target_is_word = False
         self.llm_restore_kind = ""
         self.llm_restore_query = ""
@@ -40,7 +41,15 @@ class BootstrapMixin:
         cur.execute('CREATE TABLE IF NOT EXISTS queries (query TEXT PRIMARY KEY, count INTEGER DEFAULT 0, last_at TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS notes (query TEXT PRIMARY KEY, content TEXT, updated_at TEXT)')
         cur.execute("CREATE TABLE IF NOT EXISTS reviewing (query TEXT PRIMARY KEY, proficiency TEXT DEFAULT '人上人', created_at TEXT, last_visited_at TEXT)")
-        cur.execute('CREATE TABLE IF NOT EXISTS word_links (id INTEGER PRIMARY KEY AUTOINCREMENT, word_a TEXT NOT NULL, word_b TEXT NOT NULL, created_at TEXT, UNIQUE(word_a, word_b))')
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS word_links ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "word_a TEXT NOT NULL, "
+            "word_b TEXT NOT NULL, "
+            "link_type TEXT NOT NULL DEFAULT '近义词', "
+            "created_at TEXT, "
+            "UNIQUE(word_a, word_b))"
+        )
         cur.execute('CREATE TABLE IF NOT EXISTS inner_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, tool TEXT NOT NULL, content TEXT, config_json TEXT, rating INTEGER, created_at TEXT, updated_at TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS doc_notes (file_path TEXT PRIMARY KEY, title TEXT, content TEXT, source_text TEXT, updated_at TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS doc_annotations (id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT NOT NULL, start_pos INTEGER NOT NULL, end_pos INTEGER NOT NULL, selected_text TEXT NOT NULL, annotation TEXT NOT NULL, created_at TEXT, updated_at TEXT)')
@@ -49,6 +58,7 @@ class BootstrapMixin:
         self.llm_cache_store.ensure_schema()
         self.migrate_reviewing_schema()
         self.migrate_wordcraft_annotations_schema()
+        self.migrate_word_links_schema()
         self.user_conn.commit()
         cur.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)')
@@ -154,6 +164,21 @@ class BootstrapMixin:
         cur.execute('DROP TABLE wordcraft_annotations')
         cur.execute('ALTER TABLE wordcraft_annotations_new RENAME TO wordcraft_annotations')
 
+    def migrate_word_links_schema(self):
+        cur = self.user_conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='word_links'")
+        if not cur.fetchone():
+            return
+        cur.execute('PRAGMA table_info(word_links)')
+        cols = [c[1] for c in cur.fetchall()]
+        if 'link_type' not in cols:
+            cur.execute("ALTER TABLE word_links ADD COLUMN link_type TEXT NOT NULL DEFAULT '近义词'")
+        cur.execute(
+            "UPDATE word_links SET link_type = '近义词' "
+            "WHERE link_type IS NULL OR TRIM(link_type) = '' "
+            "OR link_type NOT IN ('近义词', '反义词', '形近词')"
+        )
+
     def init_translator(self):
         self.translator = None
         self.zh_en_translator = None
@@ -209,6 +234,9 @@ class BootstrapMixin:
         if 'model_mid' not in self.settings:
             self.set_setting('model_mid', '')
             self.settings['model_mid'] = ''
+        if 'ai_example_exam_level' not in self.settings:
+            self.set_setting('ai_example_exam_level', '不限')
+            self.settings['ai_example_exam_level'] = '不限'
         if 'reviewing_sort_basis' not in self.settings:
             self.set_setting('reviewing_sort_basis', 'recommended')
             self.settings['reviewing_sort_basis'] = 'recommended'

@@ -505,7 +505,7 @@ class NavigationMixin:
             audio_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
             self.detail_info_layout.addWidget(audio_label)
         self.build_words_link_section(word_data['word'])
-        self.prepare_llm_translate_context(word_data['word'], True, 'word')
+        self.prepare_llm_translate_context(word_data['word'], True, 'word', original_meaning=word_data.get('translation', ''))
         self.build_note_section()
         self.add_ai_section()
         self.update_current_query_visuals()
@@ -617,7 +617,7 @@ class NavigationMixin:
             self.detail_info_layout.addWidget(trans_text)
             self.translation_primary_widgets = [trans_text]
             self.build_llm_translation_area()
-            self.prepare_llm_translate_context(text, False, 'sentence')
+            self.prepare_llm_translate_context(text, False, 'sentence', original_meaning=translated)
             self.build_note_section()
             self.add_ai_section()
             self.update_current_query_visuals()
