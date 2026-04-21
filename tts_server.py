@@ -48,8 +48,12 @@ async def tts(
                     yield chunk["data"]
                     
         return StreamingResponse(audio_generator(), media_type="audio/mpeg")
-    except Exception:
-        return Response(status_code=500)
+    except Exception as exc:
+        return Response(
+            status_code=503,
+            content=f"TTS synthesis failed: {str(exc)}",
+            media_type="text/plain; charset=utf-8",
+        )
 
 @app.get("/voices")
 async def get_voices():

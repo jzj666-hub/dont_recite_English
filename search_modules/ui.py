@@ -335,6 +335,7 @@ class UIMixin:
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(18, 18, 18, 18)
         main_layout.setSpacing(10)
+        self._main_layout = main_layout
         main_widget.setLayout(main_layout)
         self.main_tabs = QTabWidget()
         self.main_tabs.setDocumentMode(True)
@@ -347,17 +348,20 @@ class UIMixin:
         root_layout = QHBoxLayout()
         root_layout.setSpacing(20)
         root_layout.setContentsMargins(12, 12, 12, 12)
+        self._ext_root_layout = root_layout
         ext_page.setLayout(root_layout)
         left_container = QWidget()
         left_layout = QVBoxLayout()
         left_layout.setSpacing(20)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        self._ext_left_layout = left_layout
         left_container.setLayout(left_layout)
         root_layout.addWidget(left_container, 3)
         right_container = QWidget()
         right_layout = QVBoxLayout()
         right_layout.setSpacing(12)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        self._ext_right_layout = right_layout
         right_container.setLayout(right_layout)
         root_layout.addWidget(right_container, 1)
         header_widget = QWidget()
@@ -602,20 +606,20 @@ class UIMixin:
         export_layout.addWidget(export_desc)
         import_layout.addWidget(export_group)
 
-        # 第四态：析文（Markdown 导入 + 划线注解）
+        # 第四态：问渠（Markdown 导入 + 划线注解）
         self.doc_page = QWidget()
-        self.main_tabs.addTab(self.doc_page, "析文")
+        self.main_tabs.addTab(self.doc_page, "问渠")
         doc_layout = QVBoxLayout()
         doc_layout.setSpacing(12)
         doc_layout.setContentsMargins(18, 18, 18, 18)
         self.doc_page.setLayout(doc_layout)
 
-        doc_title = QLabel("🪶 析文 Exegesis")
+        doc_title = QLabel("🪶 问渠")
         doc_title.setFont(self.make_ui_font(24, True))
         doc_title.setStyleSheet("color: #e5c07b;")
         doc_layout.addWidget(doc_title)
 
-        doc_meta = QLabel("【析文】 披卷入微，循句采义；墨线所至，疑处可问，注解可存。")
+        doc_meta = QLabel("【问渠】 披卷入微，循句采义；墨线所至，理路渐明，心得自成。")
         doc_meta.setWordWrap(True)
         doc_meta.setStyleSheet("color: #abb2bf; margin-bottom: 8px;")
         doc_layout.addWidget(doc_meta)
@@ -694,6 +698,7 @@ class UIMixin:
         doc_main_layout = QHBoxLayout()
         doc_main_layout.setContentsMargins(0, 0, 0, 0)
         doc_main_layout.setSpacing(12)
+        self._doc_main_layout = doc_main_layout
         doc_main_row.setLayout(doc_main_layout)
         doc_main_layout.addWidget(self.doc_content_host, 5)
 
@@ -737,6 +742,7 @@ class UIMixin:
         inner_content_layout = QHBoxLayout()
         inner_content_layout.setContentsMargins(0, 0, 0, 0)
         inner_content_layout.setSpacing(12)
+        self._inner_content_layout = inner_content_layout
         inner_content.setLayout(inner_content_layout)
         inner_layout.addWidget(inner_content, 1)
         inner_left_panel = QWidget()
@@ -759,7 +765,7 @@ class UIMixin:
         fav_sort_row.setLayout(fav_sort_layout)
         fav_sort_label = QLabel("排序依据：")
         fav_sort_label.setFont(self.make_ui_font(10, False))
-        fav_sort_label.setFixedWidth(80)
+        fav_sort_label.setMinimumWidth(64)
         fav_sort_layout.addWidget(fav_sort_label)
         self.fav_sort_combo = QComboBox()
         for label, val in self.get_basis_options():
@@ -778,7 +784,7 @@ class UIMixin:
         review_sort_row.setLayout(review_sort_layout)
         review_sort_label = QLabel("排序依据：")
         review_sort_label.setFont(self.make_ui_font(10, False))
-        review_sort_label.setFixedWidth(80)
+        review_sort_label.setMinimumWidth(64)
         review_sort_layout.addWidget(review_sort_label)
         self.reviewing_sort_combo = QComboBox()
         review_sort_layout.addWidget(self.reviewing_sort_combo, 1)
@@ -849,6 +855,70 @@ class UIMixin:
             self.setup_ai_chat_shortcuts()
         self.setup_global_ui_shortcuts()
         self.init_study_timer()
+        self._apply_responsive_layout(self.width())
+
+    def _apply_responsive_layout(self, width):
+        if not isinstance(width, int):
+            return
+
+        compact = width <= 980
+        middle = 980 < width <= 1180
+
+        main_layout = getattr(self, "_main_layout", None)
+        if main_layout is not None:
+            if compact:
+                main_layout.setContentsMargins(10, 10, 10, 10)
+                main_layout.setSpacing(8)
+            elif middle:
+                main_layout.setContentsMargins(14, 14, 14, 14)
+                main_layout.setSpacing(9)
+            else:
+                main_layout.setContentsMargins(18, 18, 18, 18)
+                main_layout.setSpacing(10)
+
+        root_layout = getattr(self, "_ext_root_layout", None)
+        if root_layout is not None:
+            if compact:
+                root_layout.setContentsMargins(6, 6, 6, 6)
+                root_layout.setSpacing(8)
+                root_layout.setStretch(0, 5)
+                root_layout.setStretch(1, 1)
+            elif middle:
+                root_layout.setContentsMargins(9, 9, 9, 9)
+                root_layout.setSpacing(12)
+                root_layout.setStretch(0, 4)
+                root_layout.setStretch(1, 1)
+            else:
+                root_layout.setContentsMargins(12, 12, 12, 12)
+                root_layout.setSpacing(20)
+                root_layout.setStretch(0, 3)
+                root_layout.setStretch(1, 1)
+
+        left_layout = getattr(self, "_ext_left_layout", None)
+        if left_layout is not None:
+            left_layout.setSpacing(12 if compact else (16 if middle else 20))
+
+        doc_main_layout = getattr(self, "_doc_main_layout", None)
+        if doc_main_layout is not None:
+            doc_main_layout.setSpacing(8 if compact else (10 if middle else 12))
+
+        inner_content_layout = getattr(self, "_inner_content_layout", None)
+        if inner_content_layout is not None:
+            inner_content_layout.setSpacing(8 if compact else (10 if middle else 12))
+
+        if hasattr(self, "doc_files_list") and self.doc_files_list is not None:
+            self.doc_files_list.setMinimumWidth(140 if compact else (170 if middle else 220))
+
+        if hasattr(self, "inner_session_list") and self.inner_session_list is not None:
+            self.inner_session_list.setMinimumWidth(90 if compact else (110 if middle else 120))
+
+        if hasattr(self, "export_source_combo") and self.export_source_combo is not None:
+            self.export_source_combo.setMinimumWidth(120 if compact else (150 if middle else 180))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event is not None and event.size() is not None:
+            self._apply_responsive_layout(int(event.size().width()))
 
     def get_shortcut_pool(self):
         pool = []

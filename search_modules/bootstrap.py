@@ -40,7 +40,14 @@ class BootstrapMixin:
         cur = self.user_conn.cursor()
         cur.execute('CREATE TABLE IF NOT EXISTS queries (query TEXT PRIMARY KEY, count INTEGER DEFAULT 0, last_at TEXT)')
         cur.execute('CREATE TABLE IF NOT EXISTS notes (query TEXT PRIMARY KEY, content TEXT, updated_at TEXT)')
-        cur.execute("CREATE TABLE IF NOT EXISTS reviewing (query TEXT PRIMARY KEY, proficiency TEXT DEFAULT '人上人', created_at TEXT, last_visited_at TEXT)")
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS reviewing ("
+            "query TEXT PRIMARY KEY, "
+            "proficiency TEXT DEFAULT '人上人', "
+            "created_at TEXT, "
+            "last_visited_at TEXT, "
+            "last_active_search_at TEXT)"
+        )
         cur.execute(
             "CREATE TABLE IF NOT EXISTS word_links ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -79,8 +86,11 @@ class BootstrapMixin:
             cur.execute("ALTER TABLE reviewing ADD COLUMN proficiency TEXT DEFAULT '人上人'")
         if 'last_visited_at' not in cols:
             cur.execute('ALTER TABLE reviewing ADD COLUMN last_visited_at TEXT')
+        if 'last_active_search_at' not in cols:
+            cur.execute('ALTER TABLE reviewing ADD COLUMN last_active_search_at TEXT')
         cur.execute("UPDATE reviewing SET proficiency = '人上人'")
         cur.execute('UPDATE reviewing SET last_visited_at = COALESCE(last_visited_at, created_at)')
+        cur.execute('UPDATE reviewing SET last_active_search_at = COALESCE(last_active_search_at, last_visited_at, created_at)')
 
     def migrate_favorites_schema(self):
         cur = self.user_conn.cursor()
@@ -267,6 +277,9 @@ class BootstrapMixin:
         if 'force_topmost' not in self.settings:
             self.set_setting('force_topmost', '1')
             self.settings['force_topmost'] = '1'
+        if 'reviewing_auto_remove_days' not in self.settings:
+            self.set_setting('reviewing_auto_remove_days', '14')
+            self.settings['reviewing_auto_remove_days'] = '14'
 
     def set_setting(self, key, value):
         cur = self.user_conn.cursor()

@@ -6,7 +6,7 @@ import re
 import shutil
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote, unquote
 from urllib import error, request
 
@@ -174,12 +174,18 @@ class UserFeaturesMixin:
         self.settings["reviewing_sort_basis"] = basis
         self.refresh_internal_page()
 
-    def touch_reviewing_word(self, query):
+    def touch_reviewing_word(self, query, *, active=False):
         if not query:
             return
         ts = datetime.now().isoformat(timespec='seconds')
         cur = self.user_conn.cursor()
-        cur.execute('UPDATE reviewing SET last_visited_at = ? WHERE query = ?', (ts, query))
+        if active:
+            cur.execute(
+                'UPDATE reviewing SET last_visited_at = ?, last_active_search_at = ? WHERE query = ?',
+                (ts, ts, query),
+            )
+        else:
+            cur.execute('UPDATE reviewing SET last_visited_at = ? WHERE query = ?', (ts, query))
         self.user_conn.commit()
 
     def switch_to_internal_with_focus(self, query):
@@ -216,6 +222,9 @@ class UserFeaturesMixin:
         self.wordcraft_annotation_stream_buffers = {}
         self.wordcraft_last_hover_key = None
         self.wordcraft_annotation_hover_on_window = False
+        self.wordcraft_hover_pending_key = None
+        self.wordcraft_hover_pending_row = None
+        self.wordcraft_hover_pending_pos = None
         self.inner_wordcraft_btn = QPushButton("选词成文")
         self.inner_wordcraft_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_wordcraft_btn.setCheckable(True)
@@ -575,18 +584,35 @@ class UserFeaturesMixin:
             )
         if not tasks:
             return merged
-        prompt = (
-            "你是英语命题助手。请一次性完成多题改写，输出严格 JSON，不要 markdown。\n"
-            "仅处理题型3（英文语境猜义），题型1/2不需要处理。\n"
-            "每题要求：\n"
-            "1) 只改写题干与英文语境，不改选项文本。\n"
-            "2) 选项必须全部保留，顺序可变。\n"
-            "3) 必须保留且仅保留一个正确答案。\n"
-            "4) 输出格式："
-            "{\"items\":[{\"index\":0,\"question\":\"...\",\"context\":\"...\",\"choices\":[{\"text\":\"...\",\"is_correct\":true}],\"answer_index\":1}]}\n\n"
-            f"语境难度：{difficulty}\n"
-            f"题目列表：{json.dumps(tasks, ensure_ascii=False)}"
+        tasks_json = json.dumps(tasks, ensure_ascii=False)
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "quiz_context_rewrite_prompt",
+            (
+                "你是英语命题助手。请一次性完成多题改写，输出严格 JSON，不要 markdown。\n"
+                "仅处理题型3（英文语境猜义），题型1/2不需要处理。\n"
+                "每题要求：\n"
+                "1) 只改写题干与英文语境，不改选项文本。\n"
+                "2) 选项必须全部保留，顺序可变。\n"
+                "3) 必须保留且仅保留一个正确答案。\n"
+                "4) 输出格式：{\"items\":[{\"index\":0,\"question\":\"...\",\"context\":\"...\",\"choices\":[{\"text\":\"...\",\"is_correct\":true}],\"answer_index\":1}]}\n\n"
+                "语境难度：{difficulty}\n"
+                "题目列表：{tasks_json}"
+            ),
         )
+        prompt = (tmpl or "").replace("{difficulty}", str(difficulty)).replace("{tasks_json}", tasks_json)
+        if not prompt.strip():
+            prompt = (
+                "你是英语命题助手。请一次性完成多题改写，输出严格 JSON，不要 markdown。\n"
+                "仅处理题型3（英文语境猜义），题型1/2不需要处理。\n"
+                "每题要求：\n"
+                "1) 只改写题干与英文语境，不改选项文本。\n"
+                "2) 选项必须全部保留，顺序可变。\n"
+                "3) 必须保留且仅保留一个正确答案。\n"
+                "4) 输出格式：{\"items\":[{\"index\":0,\"question\":\"...\",\"context\":\"...\",\"choices\":[{\"text\":\"...\",\"is_correct\":true}],\"answer_index\":1}]}\n\n"
+                f"语境难度：{difficulty}\n"
+                f"题目列表：{tasks_json}"
+            )
         payload = {
             "model": model,
             "messages": [
@@ -988,18 +1014,38 @@ class UserFeaturesMixin:
                 )
             )
         wrong_tip = "有错题，请重点分析错误原因并给出纠错建议。" if wrong_rows else "本次无错题，重点给出巩固建议。"
-        return (
-            "你是英语学习教练。请根据随机考词结果给出学习反馈。\n"
-            "要求：\n"
-            "1) 先给总评（学习状态、薄弱点）。\n"
-            "2) 给出常见用法（短语、固定搭配、例句要点）。\n"
-            "3) 给出易混词辨析（至少 2 组，说明区别和记忆点）。\n"
-            "4) 如果有错题，逐题解释为什么错、正确思路、如何避免再错。\n"
-            "5) 纯文本输出，中文为主，英文词汇保留原文。\n\n"
-            f"{wrong_tip}\n\n"
-            "答题明细：\n"
-            + "\n".join(details)
+        details_text = "\n".join(details)
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "quiz_summary_prompt",
+            (
+                "你是英语学习教练。请根据随机考词结果给出学习反馈。\n"
+                "要求：\n"
+                "1) 先给总评（学习状态、薄弱点）。\n"
+                "2) 给出常见用法（短语、固定搭配、例句要点）。\n"
+                "3) 给出易混词辨析（至少 2 组，说明区别和记忆点）。\n"
+                "4) 如果有错题，逐题解释为什么错、正确思路、如何避免再错。\n"
+                "5) 纯文本输出，中文为主，英文词汇保留原文。\n\n"
+                "{wrong_tip}\n\n"
+                "答题明细：\n"
+                "{details}"
+            ),
         )
+        try:
+            return (tmpl or "").format(wrong_tip=wrong_tip, details=details_text)
+        except Exception:
+            return (
+                "你是英语学习教练。请根据随机考词结果给出学习反馈。\n"
+                "要求：\n"
+                "1) 先给总评（学习状态、薄弱点）。\n"
+                "2) 给出常见用法（短语、固定搭配、例句要点）。\n"
+                "3) 给出易混词辨析（至少 2 组，说明区别和记忆点）。\n"
+                "4) 如果有错题，逐题解释为什么错、正确思路、如何避免再错。\n"
+                "5) 纯文本输出，中文为主，英文词汇保留原文。\n\n"
+                f"{wrong_tip}\n\n"
+                "答题明细：\n"
+                + details_text
+            )
 
     def start_quiz_summary_flow(self, answers):
         if hasattr(self, "quiz_submit_btn") and self.quiz_submit_btn is not None:
@@ -1028,7 +1074,7 @@ class UserFeaturesMixin:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "你是英语学习助手。"},
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "quiz_summary_system", "你是英语学习助手。")},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.3,
@@ -1413,6 +1459,35 @@ class UserFeaturesMixin:
             silent=True,
         )
 
+    def _qt_text_pos_to_py_index(self, text, qt_pos):
+        raw = text or ""
+        try:
+            target = int(qt_pos)
+        except Exception:
+            target = 0
+        if target <= 0:
+            return 0
+        units = 0
+        for idx, ch in enumerate(raw):
+            units += 2 if ord(ch) > 0xFFFF else 1
+            if units > target:
+                return idx + 1
+            if units == target:
+                return idx + 1
+        return len(raw)
+
+    def _py_index_to_qt_text_pos(self, text, py_index):
+        raw = text or ""
+        try:
+            target = int(py_index)
+        except Exception:
+            target = 0
+        target = max(0, min(target, len(raw)))
+        units = 0
+        for ch in raw[:target]:
+            units += 2 if ord(ch) > 0xFFFF else 1
+        return units
+
     def _resolve_wordcraft_selection_range(self, selected_text):
         selected = (selected_text or "").strip()
         if not selected or not hasattr(self, "inner_dialog_editor"):
@@ -1422,8 +1497,50 @@ class UserFeaturesMixin:
             return -1, -1
         idx = text.find(selected)
         if idx >= 0:
-            return idx, idx + len(selected)
-        return -1, -1
+            return (
+                self._py_index_to_qt_text_pos(text, idx),
+                self._py_index_to_qt_text_pos(text, idx + len(selected)),
+            )
+
+        def normalize_with_map(raw):
+            out = []
+            pos_map = []
+            i = 0
+            n = len(raw)
+            while i < n:
+                ch = raw[i]
+                if ch.isspace():
+                    out.append(" ")
+                    pos_map.append(i)
+                    while i < n and raw[i].isspace():
+                        i += 1
+                    continue
+                out.append(ch)
+                pos_map.append(i)
+                i += 1
+            pos_map.append(n)
+            return "".join(out), pos_map
+
+        norm_text, text_map = normalize_with_map(text)
+        norm_sel, _ = normalize_with_map(selected)
+        norm_sel = norm_sel.strip()
+        if not norm_sel:
+            return -1, -1
+        norm_idx = norm_text.find(norm_sel)
+        if norm_idx < 0:
+            return -1, -1
+        start = text_map[norm_idx]
+        end_norm = norm_idx + len(norm_sel)
+        if end_norm >= len(text_map):
+            end = len(text)
+        else:
+            end = text_map[end_norm]
+        if end <= start:
+            end = min(len(text), start + len(selected))
+        return (
+            self._py_index_to_qt_text_pos(text, start),
+            self._py_index_to_qt_text_pos(text, end),
+        )
 
     def _build_wordcraft_annotation_context(self, selected_text, start_pos, end_pos):
         full_text = self.inner_dialog_editor.toPlainText() if hasattr(self, "inner_dialog_editor") else ""
@@ -1439,6 +1556,8 @@ class UserFeaturesMixin:
             start, end = self._resolve_wordcraft_selection_range(token)
         if start < 0 or end <= start:
             return token
+        start = self._qt_text_pos_to_py_index(full_text, start)
+        end = self._qt_text_pos_to_py_index(full_text, end)
         start = max(0, min(start, len(full_text)))
         end = max(start + 1, min(end, len(full_text)))
         window = 420
@@ -1462,10 +1581,13 @@ class UserFeaturesMixin:
         context_text = self._build_wordcraft_annotation_context(selected, start_pos, end_pos)
         tmpl = prompt_text(
             self.get_ai_prompts(),
-            "doc_reader_explain_prompt",
+            "wordcraft_annotation_prompt",
             (
                 "你是英语学习助手。请结合上下文解释用户圈选文本的含义。\n"
-                "输出纯文本，不要小标题、序号或 Markdown。\n\n"
+                "输出要求：\n"
+                "1) 只输出纯文本，不要小标题、序号、Markdown、代码块。\n"
+                "2) 第一行必须先用中文引号输出该片段在当前语境下的直接意思，例如： “……” 。\n"
+                "3) 引号句后，再补充关键语境点或语法点。\n\n"
                 "待解读上下文：\n{source_context}\n\n"
                 "待解读内容：\n{selected_text}"
             ),
@@ -1479,6 +1601,7 @@ class UserFeaturesMixin:
         except Exception:
             prompt = (
                 "你是英语学习助手。请结合上下文解释用户选中片段在此处的意思。"
+                "第一行先用中文引号直接说出该片段在此语境的意思。"
                 "输出纯文本，不要标题。\n\n"
                 f"上下文：\n{context_text}\n\n"
                 f"片段：\n{selected}"
@@ -1675,6 +1798,8 @@ class UserFeaturesMixin:
             note,
         )
         if not row:
+            if not (result or {}).get("silent"):
+                QMessageBox.warning(self, "AI 注释失败", "无法定位原文片段，注释未保存。请重新框选后再试。")
             return
         self.apply_wordcraft_annotation_highlights()
         self.open_wordcraft_annotation_window(row=row)
@@ -1685,12 +1810,41 @@ class UserFeaturesMixin:
         note = (annotation or "").strip()
         if sid <= 0 or not token or not note:
             return None
+        full_text = self.inner_dialog_editor.toPlainText() if hasattr(self, "inner_dialog_editor") else ""
         s_pos = int(start_pos)
         e_pos = int(end_pos)
+        if (
+            full_text
+            and s_pos >= 0
+            and e_pos > s_pos
+        ):
+            py_s = self._qt_text_pos_to_py_index(full_text, s_pos)
+            py_e = self._qt_text_pos_to_py_index(full_text, e_pos)
+            py_s = max(0, min(py_s, len(full_text)))
+            py_e = max(0, min(py_e, len(full_text)))
+            while py_s < py_e and full_text[py_s].isspace():
+                py_s += 1
+            while py_e > py_s and full_text[py_e - 1].isspace():
+                py_e -= 1
+            if py_e <= py_s:
+                s_pos, e_pos = -1, -1
+            else:
+                s_pos = self._py_index_to_qt_text_pos(full_text, py_s)
+                e_pos = self._py_index_to_qt_text_pos(full_text, py_e)
+        else:
+            s_pos, e_pos = -1, -1
         if s_pos < 0 or e_pos <= s_pos:
-            s_pos, e_pos = self._resolve_wordcraft_selection_range(token)
+            if full_text:
+                s_pos, e_pos = self._resolve_wordcraft_annotation_range(full_text, token, start_pos, end_pos)
+            else:
+                s_pos, e_pos = self._resolve_wordcraft_selection_range(token)
         if s_pos < 0 or e_pos <= s_pos:
-            s_pos, e_pos = 0, 0
+            return None
+        if full_text and s_pos >= 0 and e_pos > s_pos:
+            py_s = self._qt_text_pos_to_py_index(full_text, s_pos)
+            py_e = self._qt_text_pos_to_py_index(full_text, e_pos)
+            if 0 <= py_s < py_e <= len(full_text):
+                token = full_text[py_s:py_e]
         ts = datetime.now().isoformat(timespec="seconds")
         cur = self.user_conn.cursor()
         cur.execute(
@@ -1737,6 +1891,94 @@ class UserFeaturesMixin:
             )
         return out
 
+    def _resolve_wordcraft_annotation_range(self, text, selected_text, start_hint=-1, end_hint=-1):
+        token = selected_text or ""
+        if not text or not token:
+            return -1, -1
+        try:
+            start_hint = int(start_hint)
+            end_hint = int(end_hint)
+        except Exception:
+            start_hint, end_hint = -1, -1
+        start_hint_py = self._qt_text_pos_to_py_index(text, start_hint) if start_hint >= 0 else -1
+        end_hint_py = self._qt_text_pos_to_py_index(text, end_hint) if end_hint > start_hint else -1
+        if (
+            start_hint_py >= 0
+            and end_hint_py > start_hint_py
+            and end_hint_py <= len(text)
+            and text[start_hint_py:end_hint_py] == token
+        ):
+            return start_hint, end_hint
+        matches = []
+        begin = 0
+        while True:
+            idx = text.find(token, begin)
+            if idx < 0:
+                break
+            matches.append(idx)
+            begin = idx + len(token)
+        if matches:
+            if start_hint_py >= 0:
+                best_start = min(matches, key=lambda pos: abs(pos - start_hint_py))
+            else:
+                best_start = matches[0]
+            best_end = best_start + len(token)
+            return (
+                self._py_index_to_qt_text_pos(text, best_start),
+                self._py_index_to_qt_text_pos(text, best_end),
+            )
+
+        def normalize_with_map(raw):
+            out = []
+            pos_map = []
+            i = 0
+            n = len(raw)
+            while i < n:
+                ch = raw[i]
+                if ch.isspace():
+                    out.append(" ")
+                    pos_map.append(i)
+                    while i < n and raw[i].isspace():
+                        i += 1
+                    continue
+                out.append(ch)
+                pos_map.append(i)
+                i += 1
+            pos_map.append(n)
+            return "".join(out), pos_map
+
+        norm_text, text_map = normalize_with_map(text)
+        norm_token, _ = normalize_with_map(token)
+        norm_token = norm_token.strip()
+        if not norm_token:
+            return -1, -1
+        norm_matches = []
+        begin = 0
+        while True:
+            idx = norm_text.find(norm_token, begin)
+            if idx < 0:
+                break
+            norm_matches.append(idx)
+            begin = idx + len(norm_token)
+        if not norm_matches:
+            return -1, -1
+        if start_hint_py >= 0:
+            best_norm_start = min(norm_matches, key=lambda pos: abs(text_map[pos] - start_hint_py))
+        else:
+            best_norm_start = norm_matches[0]
+        start = text_map[best_norm_start]
+        end_norm = best_norm_start + len(norm_token)
+        if end_norm >= len(text_map):
+            end = len(text)
+        else:
+            end = text_map[end_norm]
+        if end <= start:
+            end = min(len(text), start + len(token))
+        return (
+            self._py_index_to_qt_text_pos(text, start),
+            self._py_index_to_qt_text_pos(text, end),
+        )
+
     def _build_wordcraft_annotation_cache(self, text):
         sid = self._active_wordcraft_session_id()
         cache = []
@@ -1746,10 +1988,9 @@ class UserFeaturesMixin:
             start_pos = int(row.get("start_pos", -1))
             end_pos = int(row.get("end_pos", -1))
             selected_text = row.get("selected_text", "")
-            if not (selected_text and start_pos >= 0 and end_pos > start_pos and end_pos <= len(text) and text[start_pos:end_pos] == selected_text):
+            resolved_start, resolved_end = self._resolve_wordcraft_annotation_range(text, selected_text, start_pos, end_pos)
+            if resolved_start < 0 or resolved_end <= resolved_start:
                 continue
-            resolved_start = start_pos
-            resolved_end = end_pos
             cache.append(
                 {
                     "id": int(row.get("id", 0)),
@@ -1788,12 +2029,23 @@ class UserFeaturesMixin:
         if not row:
             return []
         sid = int(row.get("session_id", self._active_wordcraft_session_id()) or 0)
+        ann_id = int(row.get("id", 0) or 0)
         token = (row.get("selected_text", "") or "").strip()
         start_pos = int(row.get("start_pos", -1))
         end_pos = int(row.get("end_pos", -1))
         if sid <= 0 or not token:
             return []
         cur = self.user_conn.cursor()
+        if ann_id > 0:
+            cur.execute(
+                "SELECT id, start_pos, end_pos, selected_text FROM wordcraft_annotations WHERE id = ? AND session_id = ?",
+                (ann_id, sid),
+            )
+            anchor = cur.fetchone()
+            if anchor:
+                start_pos = int(anchor[1])
+                end_pos = int(anchor[2])
+                token = (anchor[3] or "").strip() or token
         if start_pos >= 0 and end_pos > start_pos:
             cur.execute(
                 "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
@@ -1801,14 +2053,23 @@ class UserFeaturesMixin:
                 "ORDER BY id DESC",
                 (sid, start_pos, end_pos, token),
             )
+            fetched = cur.fetchall()
+            if not fetched:
+                cur.execute(
+                    "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
+                    "FROM wordcraft_annotations WHERE session_id = ? AND selected_text = ? ORDER BY id DESC",
+                    (sid, token),
+                )
+                fetched = cur.fetchall()
         else:
             cur.execute(
                 "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
                 "FROM wordcraft_annotations WHERE session_id = ? AND selected_text = ? ORDER BY id DESC",
                 (sid, token),
             )
+            fetched = cur.fetchall()
         out = []
-        for r in cur.fetchall():
+        for r in fetched:
             out.append(
                 {
                     "id": int(r[0]),
@@ -1904,7 +2165,46 @@ class UserFeaturesMixin:
             self.wordcraft_annotation_window_detail.clear()
             return
         row = current.data(Qt.ItemDataRole.UserRole) or {}
-        self.wordcraft_annotation_window_detail.setPlainText((row.get("annotation", "") or "").strip())
+        note = (row.get("annotation", "") or "").strip()
+        extra = self.get_wordcraft_annotation_extra_translation(row)
+        if extra:
+            self.wordcraft_annotation_window_detail.setPlainText(f"{note}\n\n【机器翻译/词条释义】\n{extra}")
+        else:
+            self.wordcraft_annotation_window_detail.setPlainText(note)
+
+    def get_wordcraft_annotation_extra_translation(self, row):
+        token = (row.get("selected_text", "") or "").strip()
+        if not token:
+            return ""
+        is_single_word = re.fullmatch(r"[A-Za-z]+(?:['-][A-Za-z]+)*", token) is not None
+        has_english = re.search(r"[A-Za-z]", token) is not None
+        if not has_english:
+            return ""
+        # 单词优先走词条释义；短语/句子走内置离线翻译（Argos），不请求 AI。
+        if is_single_word:
+            exact = self.lookup_dictionary_word_exact(token)
+            if exact:
+                text = self.get_word_translation(exact)
+                if text:
+                    return text
+            normalized = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", token)
+            if normalized:
+                exact_normalized = self.lookup_dictionary_word_exact(normalized)
+                if exact_normalized:
+                    text = self.get_word_translation(exact_normalized)
+                    if text:
+                        return text
+        translator = getattr(self, "translator", None)
+        if translator is None:
+            return "暂无机器翻译或词条中文释义"
+        try:
+            translated = (translator.translate(token) or "").strip()
+        except Exception:
+            return "暂无机器翻译或词条中文释义"
+        if not translated:
+            return "暂无机器翻译或词条中文释义"
+        translated = re.sub(r"\s+", " ", translated)
+        return translated[:240]
 
     def on_wordcraft_annotation_delete_clicked(self):
         if not hasattr(self, "wordcraft_annotation_window_list"):
@@ -1922,6 +2222,14 @@ class UserFeaturesMixin:
         self.user_conn.commit()
         self.apply_wordcraft_annotation_highlights()
         anchor = getattr(self, "wordcraft_annotation_window_anchor", None)
+        if anchor and not self._get_wordcraft_annotations_for_fragment(anchor):
+            self.wordcraft_annotation_window_anchor = None
+            self.wordcraft_last_hover_key = None
+            self.wordcraft_hover_pending_key = None
+            self.wordcraft_hover_pending_row = None
+            self.wordcraft_hover_pending_pos = None
+            self.open_wordcraft_annotation_window(row=None)
+            return
         self.open_wordcraft_annotation_window(row=anchor)
 
     def on_wordcraft_annotation_manage_clicked(self):
@@ -1931,6 +2239,54 @@ class UserFeaturesMixin:
         timer = getattr(self, "wordcraft_annotation_close_timer", None)
         if timer is not None:
             timer.stop()
+
+    def _cancel_wordcraft_annotation_open(self):
+        timer = getattr(self, "wordcraft_annotation_open_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _schedule_wordcraft_annotation_open(self, row, global_pos, delay_ms=500):
+        if not row:
+            self._cancel_wordcraft_annotation_open()
+            self.wordcraft_hover_pending_key = None
+            self.wordcraft_hover_pending_row = None
+            self.wordcraft_hover_pending_pos = None
+            return
+        key = (
+            int(row.get("start_pos", -1)),
+            int(row.get("end_pos", -1)),
+            (row.get("selected_text", "") or "").strip(),
+        )
+        if key == getattr(self, "wordcraft_last_hover_key", None):
+            self._cancel_wordcraft_annotation_close()
+            return
+        if key == getattr(self, "wordcraft_hover_pending_key", None):
+            self.wordcraft_hover_pending_pos = QPoint(int(global_pos.x()), int(global_pos.y())) if global_pos is not None else None
+            return
+        self.wordcraft_hover_pending_key = key
+        self.wordcraft_hover_pending_row = dict(row)
+        self.wordcraft_hover_pending_pos = QPoint(int(global_pos.x()), int(global_pos.y())) if global_pos is not None else None
+        timer = getattr(self, "wordcraft_annotation_open_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._open_pending_wordcraft_annotation_window)
+            self.wordcraft_annotation_open_timer = timer
+        timer.start(max(1, int(delay_ms)))
+
+    def _open_pending_wordcraft_annotation_window(self):
+        row = getattr(self, "wordcraft_hover_pending_row", None)
+        key = getattr(self, "wordcraft_hover_pending_key", None)
+        if not row or not key:
+            return
+        if key == getattr(self, "wordcraft_last_hover_key", None):
+            return
+        global_pos = getattr(self, "wordcraft_hover_pending_pos", None)
+        self.open_wordcraft_annotation_window(row=row, global_pos=global_pos)
+        self.wordcraft_last_hover_key = key
+        self.wordcraft_hover_pending_key = None
+        self.wordcraft_hover_pending_row = None
+        self.wordcraft_hover_pending_pos = None
 
     def _clamp_wordcraft_annotation_pos(self, pos, dlg):
         if pos is None:
@@ -1999,24 +2355,24 @@ class UserFeaturesMixin:
         cursor = self.inner_dialog_editor.cursorForPosition(event.pos())
         row = self._get_wordcraft_annotation_by_pos(cursor.position())
         if not row:
+            self._cancel_wordcraft_annotation_open()
+            self.wordcraft_hover_pending_key = None
+            self.wordcraft_hover_pending_row = None
+            self.wordcraft_hover_pending_pos = None
             self.wordcraft_last_hover_key = None
             self._schedule_wordcraft_annotation_close(500)
             return
-        key = (
-            int(row.get("start_pos", -1)),
-            int(row.get("end_pos", -1)),
-            (row.get("selected_text", "") or "").strip(),
-        )
-        if key == getattr(self, "wordcraft_last_hover_key", None):
-            self._cancel_wordcraft_annotation_close()
-            return
-        self.wordcraft_last_hover_key = key
-        self.open_wordcraft_annotation_window(row=row, global_pos=self.inner_dialog_editor.mapToGlobal(event.pos()))
+        self._cancel_wordcraft_annotation_close()
+        self._schedule_wordcraft_annotation_open(row=row, global_pos=self.inner_dialog_editor.mapToGlobal(event.pos()), delay_ms=500)
 
     def on_inner_dialog_leave(self, event):
         handler = getattr(self.inner_dialog_editor, "_orig_leave_event", None) if hasattr(self, "inner_dialog_editor") else None
         if handler is not None:
             handler(event)
+        self._cancel_wordcraft_annotation_open()
+        self.wordcraft_hover_pending_key = None
+        self.wordcraft_hover_pending_row = None
+        self.wordcraft_hover_pending_pos = None
         self.wordcraft_last_hover_key = None
         self._schedule_wordcraft_annotation_close(500)
 
@@ -2059,6 +2415,70 @@ class UserFeaturesMixin:
             return datetime.fromisoformat(raw)
         except Exception:
             return None
+
+    def get_reviewing_auto_remove_days(self):
+        raw = (self.settings.get("reviewing_auto_remove_days", "14") or "").strip()
+        try:
+            days = int(raw)
+        except Exception:
+            days = 14
+        return max(1, days)
+
+    def extract_english_words(self, text):
+        token = (text or "").strip()
+        if not token:
+            return set()
+        return {m.lower() for m in re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", token)}
+
+    def is_query_covered_by_annotations(self, query, annotation_texts, annotation_words):
+        token = (query or "").strip()
+        if not token:
+            return False
+        key = token.lower()
+        if re.fullmatch(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", token):
+            return key in annotation_words
+        normalized_query = re.sub(r"\s+", " ", key)
+        if not normalized_query:
+            return False
+        for text in annotation_texts:
+            if normalized_query in text:
+                return True
+        return False
+
+    def remove_expired_reviewing_words(self):
+        days = self.get_reviewing_auto_remove_days()
+        deadline = datetime.now() - timedelta(days=days)
+        cur = self.user_conn.cursor()
+        cur.execute("SELECT query, last_active_search_at, created_at FROM reviewing")
+        rows = cur.fetchall()
+        if not rows:
+            return []
+        cur.execute(
+            "SELECT selected_text FROM doc_annotations "
+            "UNION ALL "
+            "SELECT selected_text FROM wordcraft_annotations"
+        )
+        annotation_rows = cur.fetchall()
+        annotation_texts = []
+        annotation_words = set()
+        for row in annotation_rows:
+            raw = (row[0] if row else "") or ""
+            normalized = re.sub(r"\s+", " ", raw.lower()).strip()
+            if normalized:
+                annotation_texts.append(normalized)
+                annotation_words.update(self.extract_english_words(raw))
+        to_remove = []
+        for query, last_active_at, created_at in rows:
+            active_dt = self.parse_iso_ts(last_active_at) or self.parse_iso_ts(created_at)
+            if active_dt is None or active_dt > deadline:
+                continue
+            if self.is_query_covered_by_annotations(query, annotation_texts, annotation_words):
+                continue
+            to_remove.append(((query or "").strip(),))
+        if to_remove:
+            cur.executemany("DELETE FROM reviewing WHERE query = ? COLLATE NOCASE", to_remove)
+            self.user_conn.commit()
+        return [x[0] for x in to_remove]
 
     def format_relative_time(self, dt):
         if not dt:
@@ -2353,9 +2773,11 @@ class UserFeaturesMixin:
             self.get_ai_prompts(),
             "wordcraft_generate_prompt",
             (
-                "你是英语学习助手。请用给定目标词写一段自然英文短文，并给出中文译文。\n"
+                "你是英语学习助手。请先完成“阶段1：生成草稿”。\n"
+                "请用给定目标词写一篇连贯、自然、细节完整的英文文章，并给出中文译文。\n"
                 "输出严格 JSON：{\"english\":\"...\",\"chinese\":\"...\",\"special_words\":[\"w1\",\"w2\"]}\n"
                 "special_words 只保留正文里出现且来自目标词的单词。\n"
+                "质量要求：尽量避免语法错误与表达断裂；英文字数不设上限。\n"
                 "目标难度：{difficulty}\n选词依据：{basis}\n目标词：{words}"
             ),
         )
@@ -2365,6 +2787,58 @@ class UserFeaturesMixin:
             .replace("{basis}", mode_name)
             .replace("{words}", joined)
         )
+
+    def build_wordcraft_review_prompt(self, draft_json, words, cfg):
+        joined = ", ".join(words)
+        mode_name = {
+            "recommended": "推荐（查询时间+熟练度加权）",
+            "recent": "最近查询时间",
+            "random": "完全随机",
+            "proficiency": "熟练度",
+            "self_select": "自选择",
+        }.get(cfg.get("basis", "recommended"), "推荐")
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "wordcraft_review_prompt",
+            (
+                "你是英语学习助手。请完成“阶段2：审查错误并润色”。\n"
+                "你会收到阶段1产出的 JSON 草稿，请修正英文中的语法/搭配/时态/连贯性问题，并同步修正中文译文。\n"
+                "不要删除核心信息，不要改写成完全不同的内容。\n"
+                "英文字数不设上限。\n"
+                "输出严格 JSON：{\"english\":\"...\",\"chinese\":\"...\",\"special_words\":[\"w1\",\"w2\"]}\n"
+                "special_words 仅包含最终英文正文里实际出现且来自目标词的单词。\n"
+                "目标难度：{difficulty}\n选词依据：{basis}\n目标词：{words}\n"
+                "阶段1草稿 JSON：\n{draft_json}"
+            ),
+        )
+        text = tmpl or ""
+        return (
+            text.replace("{difficulty}", str(cfg.get("difficulty", "CET-4")))
+            .replace("{basis}", mode_name)
+            .replace("{words}", joined)
+            .replace("{draft_json}", draft_json or "{}")
+        )
+
+    def parse_wordcraft_json_result(self, answer):
+        raw = (answer or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw)
+        english_text = ""
+        chinese_text = ""
+        special_words = []
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return "", "", []
+        if not isinstance(obj, dict):
+            return "", "", []
+        english_text = str(obj.get("english", "")).strip()
+        chinese_text = str(obj.get("chinese", "")).strip()
+        raw_special = obj.get("special_words", [])
+        if isinstance(raw_special, list):
+            special_words = [str(x).strip() for x in raw_special if str(x).strip()]
+        return english_text, chinese_text, special_words
 
     def run_wordcraft_ai_generation(self):
         self.load_wordcraft_config()
@@ -2379,7 +2853,7 @@ class UserFeaturesMixin:
             QMessageBox.warning(self, "选词成文", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
             return
         prompt = self.build_wordcraft_prompt(words, self.wordcraft_config)
-        self.set_inner_markdown_preview("正在生成，请稍候...")
+        self.set_inner_markdown_preview("正在生成并审查润色，请稍候...")
         self.wordcraft_space_highlight_on = False
         self.wordcraft_show_assist_on = False
         self.wordcraft_pending_segments = []
@@ -2395,37 +2869,56 @@ class UserFeaturesMixin:
         ).start()
 
     def _wordcraft_worker(self, url, key, model, prompt, words, cfg):
-        payload = {
+        system_prompt = prompt_text(
+            self.get_ai_prompts(),
+            "wordcraft_generation_system",
+            "你是英语学习助手。请严格按用户要求输出。",
+        )
+        generate_payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "你是英语学习助手。请严格按用户要求输出。"},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.5,
+            "temperature": 0.4,
         }
         try:
-            answer = (self.request_ai_stream_text(url, key, payload, timeout=90) or "").strip()
-            if not answer:
-                answer = "模型未返回内容。"
-            english_text = ""
-            chinese_text = ""
-            try:
-                obj = json.loads(answer)
-                if isinstance(obj, dict):
-                    english_text = str(obj.get("english", "")).strip()
-                    chinese_text = str(obj.get("chinese", "")).strip()
-            except Exception:
-                pass
+            draft_answer = (self.request_ai_stream_text(url, key, generate_payload, timeout=90) or "").strip()
+            if not draft_answer:
+                draft_answer = "模型未返回内容。"
+            draft_english, draft_chinese, draft_special_words = self.parse_wordcraft_json_result(draft_answer)
+            if not draft_english:
+                draft_english = draft_answer
+
+            review_input_obj = {
+                "english": draft_english,
+                "chinese": draft_chinese,
+                "special_words": draft_special_words,
+            }
+            review_prompt = self.build_wordcraft_review_prompt(
+                json.dumps(review_input_obj, ensure_ascii=False),
+                words,
+                cfg,
+            )
+            review_payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": review_prompt},
+                ],
+                "temperature": 0.2,
+            }
+            reviewed_answer = (self.request_ai_stream_text(url, key, review_payload, timeout=90) or "").strip()
+            if not reviewed_answer:
+                reviewed_answer = draft_answer
+
+            english_text, chinese_text, special_words = self.parse_wordcraft_json_result(reviewed_answer)
             if not english_text:
-                english_text = answer
-            special_words = []
-            try:
-                obj = json.loads(answer)
-                raw_special = obj.get("special_words", []) if isinstance(obj, dict) else []
-                if isinstance(raw_special, list):
-                    special_words = [str(x).strip() for x in raw_special if str(x).strip()]
-            except Exception:
-                pass
+                english_text = draft_english
+            if not chinese_text:
+                chinese_text = draft_chinese
+            if not special_words:
+                special_words = draft_special_words
             self.inner_tool_result_ready.emit(
                 {
                     "ok": True,
@@ -2560,16 +3053,37 @@ class UserFeaturesMixin:
 
     def build_wordcraft_explain_prompt(self, segments, words, cfg):
         joined_segments = "\n".join([f"{idx + 1}. {s}" for idx, s in enumerate(segments)])
-        return (
-            "你是英语学习助手。请逐一讲解用户看不懂的英文片段。\n"
-            f"原始目标词：{', '.join(words)}\n"
-            f"目标难度：{cfg.get('difficulty', 'CET-4')}\n"
-            f"待讲解片段：\n{joined_segments}\n\n"
-            "输出要求：\n"
-            "1) 按片段编号逐一解释，包含词义、语法或语境难点。\n"
-            "2) 最后单独一行输出：DOWNGRADE_WORDS: w1, w2\n"
-            "3) DOWNGRADE_WORDS 只从原始目标词中选 0-5 个，不要输出其它格式。"
+        tmpl = prompt_text(
+            self.get_ai_prompts(),
+            "wordcraft_explain_prompt",
+            (
+                "你是英语学习助手。请逐一讲解用户看不懂的英文片段。\n"
+                "原始目标词：{words}\n"
+                "目标难度：{difficulty}\n"
+                "待讲解片段：\n{segments}\n\n"
+                "输出要求：\n"
+                "1) 按片段编号逐一解释，包含词义、语法或语境难点。\n"
+                "2) 最后单独一行输出：DOWNGRADE_WORDS: w1, w2\n"
+                "3) DOWNGRADE_WORDS 只从原始目标词中选 0-5 个，不要输出其它格式。"
+            ),
         )
+        try:
+            return (tmpl or "").format(
+                words=", ".join(words),
+                difficulty=cfg.get("difficulty", "CET-4"),
+                segments=joined_segments,
+            )
+        except Exception:
+            return (
+                "你是英语学习助手。请逐一讲解用户看不懂的英文片段。\n"
+                f"原始目标词：{', '.join(words)}\n"
+                f"目标难度：{cfg.get('difficulty', 'CET-4')}\n"
+                f"待讲解片段：\n{joined_segments}\n\n"
+                "输出要求：\n"
+                "1) 按片段编号逐一解释，包含词义、语法或语境难点。\n"
+                "2) 最后单独一行输出：DOWNGRADE_WORDS: w1, w2\n"
+                "3) DOWNGRADE_WORDS 只从原始目标词中选 0-5 个，不要输出其它格式。"
+            )
 
     def run_wordcraft_explain_flow(self):
         url = self.normalize_api_url(self.settings.get('api_url', ''))
@@ -2595,7 +3109,7 @@ class UserFeaturesMixin:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": "你是英语学习助手。"},
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "wordcraft_explain_system", "你是英语学习助手。")},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.3,
@@ -2662,6 +3176,7 @@ class UserFeaturesMixin:
             self.load_inner_sessions()
 
     def refresh_internal_page(self):
+        self.remove_expired_reviewing_words()
         if hasattr(self, 'inner_favorites_list'):
             self.inner_favorites_list.clear()
             f_id = self.get_current_folder_id()
@@ -2852,7 +3367,13 @@ class UserFeaturesMixin:
                 continue
             seen.add(key)
             links.append({"word": linked, "type": self.normalize_word_link_type(link_type)})
-        links.sort(key=lambda x: x.get("word", "").lower())
+        type_priority = {"近义词": 0, "反义词": 1, "形近词": 2}
+        links.sort(
+            key=lambda x: (
+                type_priority.get(self.normalize_word_link_type(x.get("type", "")), 99),
+                x.get("word", "").lower(),
+            )
+        )
         return links
 
     def build_words_link_section(self, word):
@@ -3108,24 +3629,43 @@ class UserFeaturesMixin:
         try:
             print("[AI Import] [DEBUG] 线程运行中，开始构建 Prompt")
             helper.update_status.emit("⏳ [1/4] 正在构建 AI 提示词与请求...")
-            
-            prompt = (
-                "你是一个文件解析助手。用户给你一个文件的前 500 字符样本，你需要分析这个文件的存储结构，"
-                "然后写出一段 Python 代码来提取其中所有的英语单词或短语。\n\n"
-                "**要求：**\n"
-                "1. 你的回复中必须包含且仅包含一个 Python 代码块（用 ```python ... ``` 包裹）\n"
-                "2. 代码必须定义一个函数 `extract_words(file_path: str) -> list[str]`\n"
-                "3. 该函数接收完整的文件路径，返回一个字符串列表，每个元素是一个英语单词或短语\n"
-                "4. 不要导入任何第三方库，只用 Python 标准库（如 re, csv, json, xml 等）\n"
-                "5. 尽可能智能地识别文件结构，提取出所有英语词汇/短语，去除重复\n"
-                "6. 如果文件中有中文释义、音标等附加信息，只提取英文单词部分\n\n"
-                f"**文件名：** {os.path.basename(file_path)}\n\n"
-                f"**文件样本（前 500 字符）：**\n```\n{sample}\n```"
+            prompt_tmpl = prompt_text(
+                self.get_ai_prompts(),
+                "ai_import_extract_prompt",
+                (
+                    "你是一个文件解析助手。用户给你一个文件的前 500 字符样本，你需要分析这个文件的存储结构，"
+                    "然后写出一段 Python 代码来提取其中所有的英语单词或短语。\n\n"
+                    "**要求：**\n"
+                    "1. 你的回复中必须包含且仅包含一个 Python 代码块（用 ```python ... ``` 包裹）\n"
+                    "2. 代码必须定义一个函数 `extract_words(file_path: str) -> list[str]`\n"
+                    "3. 该函数接收完整的文件路径，返回一个字符串列表，每个元素是一个英语单词或短语\n"
+                    "4. 不要导入任何第三方库，只用 Python 标准库（如 re, csv, json, xml 等）\n"
+                    "5. 尽可能智能地识别文件结构，提取出所有英语词汇/短语，去除重复\n"
+                    "6. 如果文件中有中文释义、音标等附加信息，只提取英文单词部分\n\n"
+                    "**文件名：** {file_name}\n\n"
+                    "**文件样本（前 500 字符）：**\n```\n{sample}\n```"
+                ),
             )
+            try:
+                prompt = (prompt_tmpl or "").format(file_name=os.path.basename(file_path), sample=sample)
+            except Exception:
+                prompt = (
+                    "你是一个文件解析助手。用户给你一个文件的前 500 字符样本，你需要分析这个文件的存储结构，"
+                    "然后写出一段 Python 代码来提取其中所有的英语单词或短语。\n\n"
+                    "**要求：**\n"
+                    "1. 你的回复中必须包含且仅包含一个 Python 代码块（用 ```python ... ``` 包裹）\n"
+                    "2. 代码必须定义一个函数 `extract_words(file_path: str) -> list[str]`\n"
+                    "3. 该函数接收完整的文件路径，返回一个字符串列表，每个元素是一个英语单词或短语\n"
+                    "4. 不要导入任何第三方库，只用 Python 标准库（如 re, csv, json, xml 等）\n"
+                    "5. 尽可能智能地识别文件结构，提取出所有英语词汇/短语，去除重复\n"
+                    "6. 如果文件中有中文释义、音标等附加信息，只提取英文单词部分\n\n"
+                    f"**文件名：** {os.path.basename(file_path)}\n\n"
+                    f"**文件样本（前 500 字符）：**\n```\n{sample}\n```"
+                )
             print("[AI Import] [DEBUG] Prompt 构建成功")
             
             messages = [
-                {"role": "system", "content": "你是一个精通文件格式解析的 Python 编程助手。只用代码块回答，不要多余解释。"},
+                {"role": "system", "content": prompt_text(self.get_ai_prompts(), "ai_import_extract_system", "你是一个精通文件格式解析的 Python 编程助手。只用代码块回答，不要多余解释。")},
                 {"role": "user", "content": prompt}
             ]
             
@@ -4538,7 +5078,11 @@ class UserFeaturesMixin:
             cur.execute('DELETE FROM reviewing WHERE query = ?', (self.current_query,))
         else:
             ts = datetime.now().isoformat(timespec='seconds')
-            cur.execute('INSERT INTO reviewing(query, proficiency, created_at, last_visited_at) VALUES(?, ?, ?, ?)', (self.current_query, '人上人', ts, ts))
+            cur.execute(
+                'INSERT INTO reviewing(query, proficiency, created_at, last_visited_at, last_active_search_at) '
+                'VALUES(?, ?, ?, ?, ?)',
+                (self.current_query, '人上人', ts, ts, ts),
+            )
         self.user_conn.commit()
         self.update_review_button_state(self.current_query)
         self.update_current_query_visuals()

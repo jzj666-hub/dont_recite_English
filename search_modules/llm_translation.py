@@ -13,6 +13,15 @@ from search_modules.ai_prompts import default_ai_prompts, loads_prompts, prompt_
 
 
 class LLMTranslationMixin:
+    def _llm_context_signature(self):
+        return (
+            (self.llm_target_text or "").strip(),
+            bool(getattr(self, "llm_target_is_word", False)),
+            (self.llm_restore_kind or "").strip(),
+            (self.llm_restore_query or "").strip(),
+            (getattr(self, "llm_target_original_meaning", "") or "").strip(),
+        )
+
     def get_ai_prompts(self):
         raw = self.settings.get("ai_prompts_json", "") if hasattr(self, "settings") else ""
         merged = dict(default_ai_prompts())
@@ -27,6 +36,9 @@ class LLMTranslationMixin:
         self.llm_target_is_word = bool(is_word)
         self.llm_restore_kind = restore_kind
         self.llm_restore_query = self.current_query
+        self.llm_active_context_signature = self._llm_context_signature()
+        # 切换查询上下文时立即作废旧请求，避免旧结果串到新单词。
+        self.llm_translate_request_seq = int(getattr(self, "llm_translate_request_seq", 0)) + 1
         self.llm_translate_click_count = 0
         self.hide_llm_translation_widgets()
         self.show_cached_llm_translation_if_exists()
@@ -102,6 +114,7 @@ class LLMTranslationMixin:
         self.llm_translate_click_count += 1
         self.llm_translate_request_seq = int(getattr(self, "llm_translate_request_seq", 0)) + 1
         request_seq = self.llm_translate_request_seq
+        context_signature = self._llm_context_signature()
         loading_html = f"<div style='color:#98c379;'>正在使用{html.escape(model_level)}模型翻译...</div>"
         self.show_llm_translation_in_place(loading_html)
         prompt = self.build_llm_translate_prompt(
@@ -109,7 +122,11 @@ class LLMTranslationMixin:
             self.llm_target_is_word,
             getattr(self, "llm_target_original_meaning", ""),
         )
-        threading.Thread(target=self._llm_translate_worker, args=(url, key, model, model_level, prompt, request_seq), daemon=True).start()
+        threading.Thread(
+            target=self._llm_translate_worker,
+            args=(url, key, model, model_level, prompt, request_seq, context_signature),
+            daemon=True,
+        ).start()
 
     def build_llm_translate_prompt(self, text, is_word, original_meaning=""):
         meaning_rule = "字符串数组，基于“原始中文释义”做查漏补缺；保留原释义核心，仅补充缺失义项/语境/易混差异，不要整段重译。"
@@ -146,6 +163,12 @@ class LLMTranslationMixin:
                 examples = [str(examples)]
             if not isinstance(usages, list):
                 usages = [str(usages)]
+            if (
+                len(meaning_items) == 1
+                and self._is_no_new_marker(meaning_items[0])
+                and (self._has_informative_items(examples) or self._has_informative_items(usages))
+            ):
+                meaning_items = ["结合下方例句与常见用法，可补充新的语义/语境信息。"]
             meaning_html = "".join([f"<li>{self.highlight_llm_text(str(x))}</li>" for x in meaning_items if str(x).strip()])
             example_html = "".join([f"<li>{self.highlight_llm_text(str(x))}</li>" for x in examples if str(x).strip()])
             usage_html = "".join([f"<li>{self.highlight_llm_text(str(x))}</li>" for x in usages if str(x).strip()])
@@ -162,6 +185,17 @@ class LLMTranslationMixin:
         token = re.sub(r"[，。；：、“”‘’（）()【】\\[\\],.;:!?/\\\\'\"`~\-]+", "", token)
         return token
 
+    def _is_no_new_marker(self, text):
+        cur = self.normalize_compare_text(text)
+        return cur in ("无新增", "暂无新增", "无")
+
+    def _has_informative_items(self, items):
+        for item in items or []:
+            cur = self.normalize_compare_text(item)
+            if cur and cur not in ("无", "无新增", "暂无新增", "none", "null"):
+                return True
+        return False
+
     def filter_incremental_meanings(self, meaning_items, original_meaning):
         original = self.normalize_compare_text(original_meaning)
         if not original:
@@ -171,7 +205,7 @@ class LLMTranslationMixin:
             cur = self.normalize_compare_text(item)
             if not cur:
                 continue
-            if cur == "无新增":
+            if self._is_no_new_marker(cur):
                 continue
             if cur in original or original in cur:
                 continue
@@ -203,7 +237,7 @@ class LLMTranslationMixin:
         html_text = self.format_llm_translate_output(self.llm_last_response_text)
         self.show_llm_translation_in_place(html_text)
 
-    def _llm_translate_worker(self, url, key, model, model_level, prompt, request_seq):
+    def _llm_translate_worker(self, url, key, model, model_level, prompt, request_seq, context_signature):
         payload = {
             "model": model,
             "messages": [
@@ -250,6 +284,7 @@ class LLMTranslationMixin:
                             "text": text,
                             "level": model_level,
                             "seq": request_seq,
+                            "context_signature": context_signature,
                             "streaming": True,
                             "done": False,
                         })
@@ -263,6 +298,7 @@ class LLMTranslationMixin:
                     "text": text,
                     "level": model_level,
                     "seq": request_seq,
+                    "context_signature": context_signature,
                     "streaming": False,
                     "done": True,
                 })
@@ -276,6 +312,7 @@ class LLMTranslationMixin:
                 "text": f"请求失败：HTTP {e.code} {e.reason}\n{err_body}",
                 "level": model_level,
                 "seq": request_seq,
+                "context_signature": context_signature,
                 "streaming": False,
                 "done": True,
             })
@@ -285,6 +322,7 @@ class LLMTranslationMixin:
                 "text": f"请求失败：{str(e)}",
                 "level": model_level,
                 "seq": request_seq,
+                "context_signature": context_signature,
                 "streaming": False,
                 "done": True,
             })
@@ -293,6 +331,10 @@ class LLMTranslationMixin:
         current_seq = int(getattr(self, "llm_translate_request_seq", 0))
         event_seq = int((result or {}).get("seq", current_seq))
         if event_seq != current_seq:
+            return
+        current_context = self._llm_context_signature()
+        event_context = (result or {}).get("context_signature", current_context)
+        if event_context != current_context:
             return
         text = (result or {}).get("text", "")
         self.llm_last_response_text = text

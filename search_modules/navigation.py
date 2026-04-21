@@ -15,6 +15,14 @@ from search_modules.tts_client import get_tts_client
 
 
 class NavigationMixin:
+    def mark_next_reviewing_touch_active(self):
+        self._reviewing_active_touch_pending = True
+
+    def consume_reviewing_touch_active(self):
+        active = bool(getattr(self, "_reviewing_active_touch_pending", False))
+        self._reviewing_active_touch_pending = False
+        return active
+
     def on_search_text_changed(self, text):
         if not text:
             self.candidates_list.clear()
@@ -112,6 +120,7 @@ class NavigationMixin:
             self.load_more_candidates(5)
 
     def on_candidate_activated(self, item):
+        self.mark_next_reviewing_touch_active()
         self.navigate_to_word(item.text())
 
     def on_search_key_press(self, event):
@@ -133,6 +142,7 @@ class NavigationMixin:
             if self.candidates_list.currentRow() >= 0:
                 item = self.candidates_list.currentItem()
                 if item:
+                    self.mark_next_reviewing_touch_active()
                     self.navigate_to_word(item.text())
             else:
                 self.on_enter_pressed()
@@ -156,17 +166,20 @@ class NavigationMixin:
         elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
             item = self.candidates_list.currentItem()
             if item:
+                self.mark_next_reviewing_touch_active()
                 self.navigate_to_word(item.text())
         else:
             QListWidget.keyPressEvent(self.candidates_list, event)
 
     def on_candidate_clicked(self, item):
+        self.mark_next_reviewing_touch_active()
         self.navigate_to_word(item.text())
 
     def on_enter_pressed(self):
         text = self.search_input.text().strip()
         if not text:
             return
+        self.mark_next_reviewing_touch_active()
             
         # 只要包含中文（或中英混合），直接认定为需要「中译英」长句翻译
         if self.contains_chinese(text):
@@ -285,6 +298,7 @@ class NavigationMixin:
         target = (word or "").strip()
         if not target:
             return
+        self.mark_next_reviewing_touch_active()
         if self.has_query_page():
             same = self.current_page_kind == 'word' and (self.current_query or "").lower() == target.lower()
             if not same:
@@ -334,8 +348,9 @@ class NavigationMixin:
             self.clear_detail()
         self.current_query = word
         self.increment_query_count(self.current_query)
+        active_touch = self.consume_reviewing_touch_active()
         if self.is_in_review(self.current_query):
-            self.touch_reviewing_word(self.current_query)
+            self.touch_reviewing_word(self.current_query, active=active_touch)
         word_data = {
             'word': result[1], 'sw': result[2], 'phonetic': result[3], 'definition': result[4], 'translation': result[5],
             'pos': result[6], 'collins': result[7], 'oxford': result[8], 'tag': result[9], 'bnc': result[10], 'frq': result[11],
@@ -516,8 +531,9 @@ class NavigationMixin:
             self.clear_detail()
         self.current_query = text
         self.increment_query_count(self.current_query)
+        active_touch = self.consume_reviewing_touch_active()
         if self.is_in_review(self.current_query):
-            self.touch_reviewing_word(self.current_query)
+            self.touch_reviewing_word(self.current_query, active=active_touch)
         try:
             is_chinese = self.contains_chinese(text)
             active_translator = self.zh_en_translator if is_chinese else self.translator

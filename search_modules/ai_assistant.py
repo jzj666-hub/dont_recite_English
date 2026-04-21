@@ -465,6 +465,9 @@ class AIAssistantMixin:
         if not current_word:
             QMessageBox.warning(self, "推荐失败", "当前词条不在词库中。")
             return
+        selected_type = self.normalize_word_link_type(
+            self.word_link_type_combo.currentText() if hasattr(self, "word_link_type_combo") else "近义词"
+        )
         url = self.normalize_api_url(self.settings.get('api_url', ''))
         key = self.settings.get('api_key', '')
         model = self.get_mid_model_name() or self.get_high_model_name()
@@ -472,11 +475,15 @@ class AIAssistantMixin:
             QMessageBox.warning(self, "推荐失败", "请先在设置中配置 API URL、API Key 和模型。")
             return
         tmpl = prompt_text(self.get_ai_prompts(), "suggest_links_prompt", "")
-        prompt = (tmpl or "").format(word=current_word)
+        prompt = (tmpl or "").format(word=current_word, link_type=selected_type)
         self.ai_link_suggest_btn.setEnabled(False)
-        threading.Thread(target=self._ai_suggest_links_worker, args=(url, key, model, current_word, prompt), daemon=True).start()
+        threading.Thread(
+            target=self._ai_suggest_links_worker,
+            args=(url, key, model, current_word, selected_type, prompt),
+            daemon=True,
+        ).start()
 
-    def _ai_suggest_links_worker(self, url, key, model, current_word, prompt):
+    def _ai_suggest_links_worker(self, url, key, model, current_word, selected_type, prompt):
         payload = {
             "model": model,
             "messages": [
@@ -488,9 +495,13 @@ class AIAssistantMixin:
         try:
             text = (self.request_ai_stream_text(url, key, payload, timeout=60) or "").strip()
             links = self.extract_word_links_from_ai_result(text)
-            self.ai_links_ready.emit({"ok": True, "links": links, "current_word": current_word})
+            self.ai_links_ready.emit(
+                {"ok": True, "links": links, "current_word": current_word, "selected_type": selected_type}
+            )
         except Exception as e:
-            self.ai_links_ready.emit({"ok": False, "error": str(e), "current_word": current_word})
+            self.ai_links_ready.emit(
+                {"ok": False, "error": str(e), "current_word": current_word, "selected_type": selected_type}
+            )
 
     def on_ai_links_result(self, result):
         if self.ai_link_suggest_btn is not None:
@@ -500,16 +511,17 @@ class AIAssistantMixin:
             QMessageBox.warning(self, "推荐失败", f"AI 推荐关联词失败：{err}")
             return
         current_word = result.get("current_word", "")
+        selected_type = self.normalize_word_link_type(result.get("selected_type", "近义词"))
         suggestions = result.get("links", [])
         valid = []
         seen = set()
         for item in suggestions:
             if isinstance(item, dict):
                 token = str(item.get("word", "")).strip()
-                tag = self.normalize_word_link_type(item.get("tag", ""))
+                tag = selected_type
             else:
                 token = str(item).strip()
-                tag = "近义词"
+                tag = selected_type
             found = self.lookup_dictionary_word_exact(token)
             if not found:
                 continue
