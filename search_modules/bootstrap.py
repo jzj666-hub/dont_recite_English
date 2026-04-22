@@ -29,6 +29,12 @@ class BootstrapMixin:
         self.wordcraft_config = {}
         self.study_timer = None
         self.study_today_label = None
+        self.study_timer_card = None
+        self.study_timer_title_label = None
+        self.study_continuous_label = None
+        self.study_rest_tip_label = None
+        self.study_continuous_minutes = 0
+        self.study_last_rest_reminder_block = 0
         self.study_last_tick_dt = datetime.now()
 
     def init_database(self):

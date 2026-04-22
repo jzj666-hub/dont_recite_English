@@ -20,10 +20,12 @@ from PyQt6.QtWidgets import (
     QKeySequenceEdit,
     QScrollArea,
     QSlider,
+    QSizePolicy,
     QStackedLayout,
     QTextBrowser,
     QTextEdit,
     QTabWidget,
+    QMainWindow,
     QGraphicsOpacityEffect,
     QVBoxLayout,
     QWidget,
@@ -288,11 +290,62 @@ class UIMixin:
     def init_study_timer(self):
         if not hasattr(self, 'study_today_label'):
             return
+        if self.study_timer is not None:
+            self.study_timer.stop()
         self.study_last_tick_dt = datetime.now()
+        self.study_continuous_minutes = 0
+        self.study_last_rest_reminder_block = 0
         self.study_timer = QTimer(self)
         self.study_timer.timeout.connect(self.on_study_timer_tick)
         self.study_timer.start(60000)
         self.on_study_timer_tick()
+
+    def format_study_minutes(self, minutes):
+        total = max(0, int(minutes or 0))
+        hours, mins = divmod(total, 60)
+        return f"{hours:02d}:{mins:02d}"
+
+    def sync_study_day_if_needed(self, now):
+        today = now.strftime('%Y-%m-%d')
+        if self.settings.get('study_minutes_date') == today:
+            return
+        self.set_setting('study_minutes_date', today)
+        self.set_setting('study_minutes_today', '0')
+        self.settings['study_minutes_date'] = today
+        self.settings['study_minutes_today'] = '0'
+        self.study_continuous_minutes = 0
+        self.study_last_rest_reminder_block = 0
+        if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
+            self.study_rest_tip_label.setText("🌞 新的一天开始啦，今天也要可爱地坚持学习～")
+
+    def is_study_tracking_active(self):
+        if not hasattr(self, 'main_tabs') or self.main_tabs is None:
+            return True
+        if self.main_tabs.currentIndex() != 0:
+            return False
+        app = QApplication.instance()
+        if app is None:
+            return True
+        return app.applicationState() == Qt.ApplicationState.ApplicationActive
+
+    def maybe_show_rest_reminder(self):
+        reminder_block = self.study_continuous_minutes // 30
+        if reminder_block <= 0 or reminder_block <= self.study_last_rest_reminder_block:
+            return
+        self.study_last_rest_reminder_block = reminder_block
+        continuous_text = self.format_study_minutes(self.study_continuous_minutes)
+        tip = f"🌷 你已经连续学习 {continuous_text} 啦！\n站起来活动一下、喝口水，再继续冲鸭～"
+        if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
+            self.study_rest_tip_label.setText(f"🫶 {continuous_text} 达成！先休息一会儿更高效～")
+        QMessageBox.information(self, "休息提醒", tip)
+
+    def update_study_rest_tip_for_active(self):
+        if not hasattr(self, 'study_rest_tip_label') or self.study_rest_tip_label is None:
+            return
+        remain = 30 - (self.study_continuous_minutes % 30)
+        if remain <= 0:
+            remain = 30
+        self.study_rest_tip_label.setText(f"🧸 专注学习中，再学 {remain} 分钟会提醒休息哦～")
 
     def get_study_minutes_today(self):
         try:
@@ -302,19 +355,35 @@ class UIMixin:
 
     def on_study_timer_tick(self):
         now = datetime.now()
+        self.sync_study_day_if_needed(now)
         delta_min = int((now - self.study_last_tick_dt).total_seconds() // 60)
+        tracking_active = self.is_study_tracking_active()
         if delta_min > 0:
+            self.study_last_tick_dt = now
+        if tracking_active:
+            self.update_study_rest_tip_for_active()
+        if delta_min > 0 and tracking_active:
             total = self.get_study_minutes_today() + delta_min
             self.set_setting('study_minutes_today', str(total))
             self.settings['study_minutes_today'] = str(total)
-            self.study_last_tick_dt = now
+            self.study_continuous_minutes += delta_min
+            self.maybe_show_rest_reminder()
+        elif delta_min > 0:
+            self.study_continuous_minutes = 0
+            self.study_last_rest_reminder_block = 0
+            if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
+                self.study_rest_tip_label.setText("🛋️ 正在休息中，回来继续学就会重新计时哦～")
         self.update_study_today_label()
 
     def update_study_today_label(self):
         if not hasattr(self, 'study_today_label') or self.study_today_label is None:
             return
         mins = self.get_study_minutes_today()
-        self.study_today_label.setText(f"🐣 今天已经学了 {mins} 分钟啦～")
+        self.study_today_label.setText(f"🍰 今日学习：{self.format_study_minutes(mins)}")
+        if hasattr(self, 'study_continuous_label') and self.study_continuous_label is not None:
+            self.study_continuous_label.setText(
+                f"🍓 连续专注：{self.format_study_minutes(self.study_continuous_minutes)}"
+            )
 
     def is_force_topmost_enabled(self):
         return str(self.settings.get('force_topmost', '1')).strip().lower() in ('1', 'true', 'yes', 'on')
@@ -328,6 +397,7 @@ class UIMixin:
         self.setWindowTitle('英语查词翻译软件')
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.is_force_topmost_enabled())
         self.setGeometry(100, 100, 900, 700)
+        self.setMinimumSize(640, 520)
         self.apply_theme()
         self.apply_font_preferences()
         main_widget = QWidget()
@@ -338,6 +408,7 @@ class UIMixin:
         self._main_layout = main_layout
         main_widget.setLayout(main_layout)
         self.main_tabs = QTabWidget()
+        self.main_tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.main_tabs.setDocumentMode(True)
         self.main_tabs.setMovable(False)
         self.main_tabs.currentChanged.connect(self.on_main_tab_changed)
@@ -379,18 +450,37 @@ class UIMixin:
         tracing_meta.setFont(self.make_ui_font(10, False))
         tracing_meta.setStyleSheet('color: #abb2bf; margin-bottom: 5px;')
         tracing_meta.setWordWrap(True)
-        self.study_today_label = QLabel("")
-        self.study_today_label.setFont(self.make_ui_font(11, False))
-        self.study_today_label.setStyleSheet('color: #ffb86b; margin-left: 12px;')
-        self.study_today_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
-        header_layout.addWidget(self.study_today_label)
         header_layout.addStretch()
         self.settings_btn = QPushButton('设置')
+        self.settings_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.settings_btn.setMinimumWidth(0)
         self.settings_btn.setFixedHeight(32)
         self.settings_btn.clicked.connect(self.open_settings_dialog)
         header_layout.addWidget(self.settings_btn)
         left_layout.addWidget(header_widget)
         left_layout.addWidget(tracing_meta)
+        self.study_timer_card = QWidget()
+        study_timer_layout = QVBoxLayout()
+        study_timer_layout.setContentsMargins(14, 12, 14, 12)
+        study_timer_layout.setSpacing(6)
+        self.study_timer_card.setLayout(study_timer_layout)
+        self.study_timer_title_label = QLabel("⏰ 单日学习计时器")
+        self.study_timer_title_label.setFont(self.make_ui_font(11, True))
+        self.study_today_label = QLabel("")
+        self.study_today_label.setFont(self.make_ui_font(11, True))
+        self.study_today_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.study_continuous_label = QLabel("")
+        self.study_continuous_label.setFont(self.make_ui_font(10, False))
+        self.study_rest_tip_label = QLabel("🧸 专注学习中，连续 30 分钟会提醒你休息哦～")
+        self.study_rest_tip_label.setFont(self.make_ui_font(9, False))
+        self.study_rest_tip_label.setWordWrap(True)
+        study_timer_layout.addWidget(self.study_timer_title_label)
+        study_timer_layout.addWidget(self.study_today_label)
+        study_timer_layout.addWidget(self.study_continuous_label)
+        study_timer_layout.addWidget(self.study_rest_tip_label)
+        left_layout.addWidget(self.study_timer_card)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText('输入单词或句子...')
         self.search_input.setFont(self.make_ui_font(14, False))
@@ -461,9 +551,13 @@ class UIMixin:
         folder_toolbar_layout.setContentsMargins(0, 0, 0, 0)
         folder_toolbar.setLayout(folder_toolbar_layout)
         self.add_folder_btn = QPushButton('新建文件夹')
+        self.add_folder_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.add_folder_btn.setMinimumWidth(0)
         self.add_folder_btn.clicked.connect(self.create_folder)
         folder_toolbar_layout.addWidget(self.add_folder_btn)
         self.delete_folder_btn = QPushButton('删除文件夹')
+        self.delete_folder_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.delete_folder_btn.setMinimumWidth(0)
         self.delete_folder_btn.clicked.connect(self.delete_current_folder)
         folder_toolbar_layout.addWidget(self.delete_folder_btn)
         folder_toolbar_layout.addStretch()
@@ -488,6 +582,7 @@ class UIMixin:
         import_layout = QVBoxLayout()
         import_layout.setSpacing(30)
         import_layout.setContentsMargins(40, 40, 40, 40)
+        self._import_layout = import_layout
         import_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         import_page.setLayout(import_layout)
 
@@ -502,9 +597,10 @@ class UIMixin:
         import_meta.setWordWrap(True)
         import_layout.addWidget(import_meta)
 
-        self.import_btn = QPushButton("📁 标准导入：选择或拖拽单词本 (.txt)")
+        self.import_btn = QPushButton("📁 标准导入（.txt）")
         self.import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.import_btn.setFixedHeight(120)
+        self.import_btn.setToolTip("标准导入：选择或拖拽单词本（.txt）")
         self.import_btn.setStyleSheet("""
             QPushButton {
                 background-color: #282c34;
@@ -521,11 +617,14 @@ class UIMixin:
             }
         """)
         self.import_btn.clicked.connect(lambda: self.on_import_txt_clicked())
+        self.import_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.import_btn.setMinimumWidth(0)
         import_layout.addWidget(self.import_btn)
 
-        self.import_ai_btn = QPushButton("🤖 AI 智能解析：导入任意格式文件")
+        self.import_ai_btn = QPushButton("🤖 AI 智能解析导入")
         self.import_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.import_ai_btn.setFixedHeight(120)
+        self.import_ai_btn.setToolTip("AI 智能解析：导入任意格式文件")
         self.import_ai_btn.setStyleSheet("""
             QPushButton {
                 background-color: #282c34;
@@ -542,6 +641,8 @@ class UIMixin:
             }
         """)
         self.import_ai_btn.clicked.connect(lambda: self.on_import_ai_clicked())
+        self.import_ai_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.import_ai_btn.setMinimumWidth(0)
         import_layout.addWidget(self.import_ai_btn)
 
         # 导入状态/日志
@@ -603,6 +704,7 @@ class UIMixin:
         export_desc = QLabel("支持从一个特定的收藏夹或者“在背状态”的单词列表中导出所有查询词。")
         export_desc.setFont(self.make_ui_font(10, False))
         export_desc.setStyleSheet("color: #abb2bf;")
+        export_desc.setWordWrap(True)
         export_layout.addWidget(export_desc)
         import_layout.addWidget(export_group)
 
@@ -635,18 +737,28 @@ class UIMixin:
         doc_btn_row.setLayout(doc_btn_layout)
         self.doc_new_btn = QPushButton("📝 新建 Markdown（.md）")
         self.doc_new_btn.clicked.connect(self.on_doc_create_markdown_clicked)
+        self.doc_new_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.doc_new_btn.setMinimumWidth(0)
         doc_btn_layout.addWidget(self.doc_new_btn)
         self.doc_import_btn = QPushButton("📁 导入 Markdown（.md）")
         self.doc_import_btn.clicked.connect(self.on_import_document_clicked)
+        self.doc_import_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.doc_import_btn.setMinimumWidth(0)
         doc_btn_layout.addWidget(self.doc_import_btn)
         self.doc_save_btn = QPushButton("💾 保存 Markdown")
         self.doc_save_btn.clicked.connect(self.on_doc_save_markdown_clicked)
+        self.doc_save_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.doc_save_btn.setMinimumWidth(0)
         doc_btn_layout.addWidget(self.doc_save_btn)
         self.doc_delete_btn = QPushButton("🗑 删除 Markdown")
         self.doc_delete_btn.clicked.connect(self.on_doc_delete_markdown_clicked)
+        self.doc_delete_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.doc_delete_btn.setMinimumWidth(0)
         doc_btn_layout.addWidget(self.doc_delete_btn)
         self.doc_annotations_btn = QPushButton("🗂 注释管理")
         self.doc_annotations_btn.clicked.connect(self.on_doc_annotation_manage_clicked)
+        self.doc_annotations_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.doc_annotations_btn.setMinimumWidth(0)
         doc_btn_layout.addWidget(self.doc_annotations_btn)
         doc_layout.addWidget(doc_btn_row)
 
@@ -808,6 +920,10 @@ class UIMixin:
         self.inner_tool_bar_layout.addStretch()
         self.inner_tool_action_1 = QPushButton("新会话")
         self.inner_tool_action_2 = QPushButton("删除会话")
+        self.inner_tool_action_1.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.inner_tool_action_1.setMinimumWidth(0)
+        self.inner_tool_action_2.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.inner_tool_action_2.setMinimumWidth(0)
         self.inner_tool_bar_layout.addWidget(self.inner_tool_action_1)
         self.inner_tool_bar_layout.addWidget(self.inner_tool_action_2)
         inner_right_layout.addWidget(self.inner_tool_bar)
@@ -898,6 +1014,18 @@ class UIMixin:
         if left_layout is not None:
             left_layout.setSpacing(12 if compact else (16 if middle else 20))
 
+        import_layout = getattr(self, "_import_layout", None)
+        if import_layout is not None:
+            if compact:
+                import_layout.setContentsMargins(12, 12, 12, 12)
+                import_layout.setSpacing(16)
+            elif middle:
+                import_layout.setContentsMargins(24, 24, 24, 24)
+                import_layout.setSpacing(22)
+            else:
+                import_layout.setContentsMargins(40, 40, 40, 40)
+                import_layout.setSpacing(30)
+
         doc_main_layout = getattr(self, "_doc_main_layout", None)
         if doc_main_layout is not None:
             doc_main_layout.setSpacing(8 if compact else (10 if middle else 12))
@@ -916,7 +1044,7 @@ class UIMixin:
             self.export_source_combo.setMinimumWidth(120 if compact else (150 if middle else 180))
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
+        QMainWindow.resizeEvent(self, event)
         if event is not None and event.size() is not None:
             self._apply_responsive_layout(int(event.size().width()))
 
@@ -1404,8 +1532,37 @@ class UIMixin:
         # 统一挂到窗口级样式，覆盖动态创建的输入框（例如随机考词中的答题输入框）
         self.setStyleSheet(input_style + "\n" + menu_style)
 
+        self.apply_study_timer_styles()
         self.apply_font_preferences()
         self.update_study_today_label()
+
+    def apply_study_timer_styles(self):
+        if not hasattr(self, 'study_timer_card') or self.study_timer_card is None:
+            return
+        theme = self.settings.get('theme', 'dark')
+        if theme == 'light':
+            card_bg = '#fff3fa'
+            card_border = '#f5b2d4'
+            title_color = '#d14f90'
+            main_color = '#9c2f66'
+            sub_color = '#8b4a6a'
+        else:
+            card_bg = '#322236'
+            card_border = '#b37aa1'
+            title_color = '#ff9bd2'
+            main_color = '#ffd9ef'
+            sub_color = '#f7c7dd'
+        self.study_timer_card.setStyleSheet(
+            f"QWidget{{background:{card_bg};border:1px solid {card_border};border-radius:14px;}}"
+        )
+        if hasattr(self, 'study_timer_title_label') and self.study_timer_title_label is not None:
+            self.study_timer_title_label.setStyleSheet(f"color:{title_color}; border:none;")
+        if hasattr(self, 'study_today_label') and self.study_today_label is not None:
+            self.study_today_label.setStyleSheet(f"color:{main_color}; border:none;")
+        if hasattr(self, 'study_continuous_label') and self.study_continuous_label is not None:
+            self.study_continuous_label.setStyleSheet(f"color:{sub_color}; border:none;")
+        if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
+            self.study_rest_tip_label.setStyleSheet(f"color:{sub_color}; border:none;")
 
     def open_settings_dialog(self):
         dlg = QDialog(self)
