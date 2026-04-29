@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import re
 
 from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QTimer, Qt, QUrl
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QPalette, QShortcut, QTextCursor, QDragEnterEvent, QDropEvent
@@ -67,8 +68,10 @@ class _GlobalUIKeyFilter(QObject):
             return bool(owner.handle_global_ui_key_press(event))
         return False
 
-from search_modules.infrastructure import build_highlighted_text_html
 from search_modules.ai_prompts import default_ai_prompts, loads_prompts
+
+APP_VERSION = "1.0.1"
+APP_WINDOW_TITLE = f"英语查词翻译软件 v{APP_VERSION}"
 
 
 class UIMixin:
@@ -288,7 +291,7 @@ class UIMixin:
         app.setFont(base)
 
     def init_study_timer(self):
-        if not hasattr(self, 'study_today_label'):
+        if not hasattr(self, 'study_today_label') or self.study_today_label is None:
             return
         if self.study_timer is not None:
             self.study_timer.stop()
@@ -316,27 +319,23 @@ class UIMixin:
         self.study_continuous_minutes = 0
         self.study_last_rest_reminder_block = 0
         if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
-            self.study_rest_tip_label.setText("🌞 新的一天开始啦，今天也要可爱地坚持学习～")
+            self.study_rest_tip_label.setText("新的一天开始，保持学习节奏。")
 
     def is_study_tracking_active(self):
-        if not hasattr(self, 'main_tabs') or self.main_tabs is None:
-            return True
-        if self.main_tabs.currentIndex() != 0:
-            return False
-        app = QApplication.instance()
-        if app is None:
-            return True
-        return app.applicationState() == Qt.ApplicationState.ApplicationActive
+        return True
 
     def maybe_show_rest_reminder(self):
         reminder_block = self.study_continuous_minutes // 30
         if reminder_block <= 0 or reminder_block <= self.study_last_rest_reminder_block:
             return
+        app = QApplication.instance()
+        if app is not None and app.applicationState() != Qt.ApplicationState.ApplicationActive:
+            return
         self.study_last_rest_reminder_block = reminder_block
         continuous_text = self.format_study_minutes(self.study_continuous_minutes)
-        tip = f"🌷 你已经连续学习 {continuous_text} 啦！\n站起来活动一下、喝口水，再继续冲鸭～"
+        tip = f"你已连续学习 {continuous_text}。\n请起身活动并补充水分后再继续。"
         if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
-            self.study_rest_tip_label.setText(f"🫶 {continuous_text} 达成！先休息一会儿更高效～")
+            self.study_rest_tip_label.setText(f"已连续学习 {continuous_text}，建议短暂休息。")
         QMessageBox.information(self, "休息提醒", tip)
 
     def update_study_rest_tip_for_active(self):
@@ -345,7 +344,7 @@ class UIMixin:
         remain = 30 - (self.study_continuous_minutes % 30)
         if remain <= 0:
             remain = 30
-        self.study_rest_tip_label.setText(f"🧸 专注学习中，再学 {remain} 分钟会提醒休息哦～")
+        self.study_rest_tip_label.setText(f"专注学习中，再过 {remain} 分钟提醒休息。")
 
     def get_study_minutes_today(self):
         try:
@@ -372,17 +371,17 @@ class UIMixin:
             self.study_continuous_minutes = 0
             self.study_last_rest_reminder_block = 0
             if hasattr(self, 'study_rest_tip_label') and self.study_rest_tip_label is not None:
-                self.study_rest_tip_label.setText("🛋️ 正在休息中，回来继续学就会重新计时哦～")
+                self.study_rest_tip_label.setText("当前未处于专注状态，恢复后将重新累计连续时长。")
         self.update_study_today_label()
 
     def update_study_today_label(self):
         if not hasattr(self, 'study_today_label') or self.study_today_label is None:
             return
         mins = self.get_study_minutes_today()
-        self.study_today_label.setText(f"🍰 今日学习：{self.format_study_minutes(mins)}")
+        self.study_today_label.setText(f"今日学习：{mins} 分钟")
         if hasattr(self, 'study_continuous_label') and self.study_continuous_label is not None:
             self.study_continuous_label.setText(
-                f"🍓 连续专注：{self.format_study_minutes(self.study_continuous_minutes)}"
+                f"连续学习：{self.format_study_minutes(self.study_continuous_minutes)}"
             )
 
     def is_force_topmost_enabled(self):
@@ -394,7 +393,7 @@ class UIMixin:
         self.show()
 
     def init_ui(self):
-        self.setWindowTitle('英语查词翻译软件')
+        self.setWindowTitle(APP_WINDOW_TITLE)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.is_force_topmost_enabled())
         self.setGeometry(100, 100, 900, 700)
         self.setMinimumSize(640, 520)
@@ -444,6 +443,14 @@ class UIMixin:
         title_label.setStyleSheet('color: #61dafb;')
         title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard)
         header_layout.addWidget(title_label)
+        self.study_today_label = QLabel("")
+        self.study_today_label.setFont(self.make_ui_font(11, True))
+        self.study_today_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.study_today_label.setMinimumWidth(0)
+        self.study_today_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        header_layout.addWidget(self.study_today_label)
 
         # 溯游寓意标注
         tracing_meta = QLabel('【溯游态】 逆流而上，穷源竟委；“道阻且长”，真意乃现。')
@@ -452,35 +459,13 @@ class UIMixin:
         tracing_meta.setWordWrap(True)
         header_layout.addStretch()
         self.settings_btn = QPushButton('设置')
-        self.settings_btn.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.settings_btn.setMinimumWidth(0)
+        self.settings_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.settings_btn.setMinimumWidth(72)
         self.settings_btn.setFixedHeight(32)
         self.settings_btn.clicked.connect(self.open_settings_dialog)
         header_layout.addWidget(self.settings_btn)
         left_layout.addWidget(header_widget)
         left_layout.addWidget(tracing_meta)
-        self.study_timer_card = QWidget()
-        study_timer_layout = QVBoxLayout()
-        study_timer_layout.setContentsMargins(14, 12, 14, 12)
-        study_timer_layout.setSpacing(6)
-        self.study_timer_card.setLayout(study_timer_layout)
-        self.study_timer_title_label = QLabel("⏰ 单日学习计时器")
-        self.study_timer_title_label.setFont(self.make_ui_font(11, True))
-        self.study_today_label = QLabel("")
-        self.study_today_label.setFont(self.make_ui_font(11, True))
-        self.study_today_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
-        self.study_continuous_label = QLabel("")
-        self.study_continuous_label.setFont(self.make_ui_font(10, False))
-        self.study_rest_tip_label = QLabel("🧸 专注学习中，连续 30 分钟会提醒你休息哦～")
-        self.study_rest_tip_label.setFont(self.make_ui_font(9, False))
-        self.study_rest_tip_label.setWordWrap(True)
-        study_timer_layout.addWidget(self.study_timer_title_label)
-        study_timer_layout.addWidget(self.study_today_label)
-        study_timer_layout.addWidget(self.study_continuous_label)
-        study_timer_layout.addWidget(self.study_rest_tip_label)
-        left_layout.addWidget(self.study_timer_card)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText('输入单词或句子...')
         self.search_input.setFont(self.make_ui_font(14, False))
@@ -1537,8 +1522,6 @@ class UIMixin:
         self.update_study_today_label()
 
     def apply_study_timer_styles(self):
-        if not hasattr(self, 'study_timer_card') or self.study_timer_card is None:
-            return
         theme = self.settings.get('theme', 'dark')
         if theme == 'light':
             card_bg = '#fff3fa'
@@ -1552,9 +1535,10 @@ class UIMixin:
             title_color = '#ff9bd2'
             main_color = '#ffd9ef'
             sub_color = '#f7c7dd'
-        self.study_timer_card.setStyleSheet(
-            f"QWidget{{background:{card_bg};border:1px solid {card_border};border-radius:14px;}}"
-        )
+        if hasattr(self, 'study_timer_card') and self.study_timer_card is not None:
+            self.study_timer_card.setStyleSheet(
+                f"QWidget{{background:{card_bg};border:1px solid {card_border};border-radius:14px;}}"
+            )
         if hasattr(self, 'study_timer_title_label') and self.study_timer_title_label is not None:
             self.study_timer_title_label.setStyleSheet(f"color:{title_color}; border:none;")
         if hasattr(self, 'study_today_label') and self.study_today_label is not None:
@@ -2091,15 +2075,50 @@ class UIMixin:
             if self.note_preview_cache_key == cache_key:
                 return
             self.note_preview_cache_key = cache_key
-            if in_review and self.current_query:
-                # 获取当前主题的高亮颜色
-                highlight_bg = self.colors.get('highlight_bg', '#6b4f00')
-                highlight_text = self.colors.get('highlight_text', '#ffe9a8')
-                highlighted_html, matched = build_highlighted_text_html(text, self.current_query, highlight_bg, highlight_text)
-                if matched:
-                    self.note_preview.setHtml(f"<div style='white-space: pre-wrap;'>{highlighted_html}</div>")
-                    return
-            self.note_preview.setMarkdown(text)
+            self.note_preview.setMarkdown(self._build_note_preview_markdown(text))
+            self.apply_note_preview_review_highlight(in_review)
+
+    def _build_note_preview_markdown(self, text):
+        raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not raw:
+            return ""
+        lines = raw.split("\n")
+        out = []
+        last = len(lines) - 1
+        for idx, line in enumerate(lines):
+            if idx < last and line.strip():
+                out.append(f"{line}  ")
+            else:
+                out.append(line)
+        return "\n".join(out)
+
+    def apply_note_preview_review_highlight(self, in_review):
+        if not hasattr(self, 'note_preview'):
+            return
+        self.note_preview.setExtraSelections([])
+        if not in_review or not self.current_query:
+            return
+        plain = self.note_preview.toPlainText()
+        q = (self.current_query or "").strip()
+        if not plain or not q:
+            return
+        if re.fullmatch(r"[A-Za-z][A-Za-z'\-]*", q):
+            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(q)}(?![A-Za-z])", re.IGNORECASE)
+        else:
+            pattern = re.compile(re.escape(q), re.IGNORECASE)
+        highlight_bg = self.colors.get('highlight_bg', '#6b4f00')
+        highlight_text = self.colors.get('highlight_text', '#ffe9a8')
+        selections = []
+        for m in pattern.finditer(plain):
+            item = QTextEdit.ExtraSelection()
+            cursor = self.note_preview.textCursor()
+            cursor.setPosition(m.start())
+            cursor.setPosition(m.end(), QTextCursor.MoveMode.KeepAnchor)
+            item.cursor = cursor
+            item.format.setBackground(QColor(highlight_bg))
+            item.format.setForeground(QColor(highlight_text))
+            selections.append(item)
+        self.note_preview.setExtraSelections(selections)
 
     def create_folder(self):
         dlg = QDialog(self)

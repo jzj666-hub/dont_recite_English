@@ -225,6 +225,9 @@ class UserFeaturesMixin:
         self.wordcraft_hover_pending_key = None
         self.wordcraft_hover_pending_row = None
         self.wordcraft_hover_pending_pos = None
+        self.wordcraft_mt_tooltip_timer = None
+        self.wordcraft_mt_pending_text = ""
+        self.wordcraft_mt_last_text = ""
         self.inner_wordcraft_btn = QPushButton("选词成文")
         self.inner_wordcraft_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_wordcraft_btn.setCheckable(True)
@@ -1353,6 +1356,8 @@ class UserFeaturesMixin:
 
     def on_inner_dialog_mouse_press(self, event):
         handler = getattr(self.inner_dialog_editor, "_orig_mouse_press", None) if hasattr(self, "inner_dialog_editor") else None
+        if self.inner_active_tool == "wordcraft":
+            self._cancel_wordcraft_machine_translation_tooltip(hide=True)
         if self.inner_active_tool == "wordcraft" and event is not None and event.button() == Qt.MouseButton.LeftButton:
             cursor = self.inner_dialog_editor.cursorForPosition(event.pos())
             line_text = (cursor.block().text() or "").strip()
@@ -1379,7 +1384,12 @@ class UserFeaturesMixin:
         if selected:
             self.wordcraft_last_selected_text = selected
         if self.inner_active_tool != "wordcraft":
+            self._cancel_wordcraft_machine_translation_tooltip(hide=True)
             return
+        if selected:
+            self._schedule_wordcraft_machine_translation_tooltip(selected)
+        else:
+            self._cancel_wordcraft_machine_translation_tooltip(hide=True)
         session_id = self._active_wordcraft_session_id()
         if session_id <= 0:
             return
@@ -1457,6 +1467,52 @@ class UserFeaturesMixin:
             start_pos=start_pos,
             end_pos=end_pos,
             silent=True,
+        )
+
+    def _cancel_wordcraft_machine_translation_tooltip(self, hide=False):
+        timer = getattr(self, "wordcraft_mt_tooltip_timer", None)
+        if timer is not None:
+            timer.stop()
+        self.wordcraft_mt_pending_text = ""
+        if hide:
+            QToolTip.hideText()
+
+    def _schedule_wordcraft_machine_translation_tooltip(self, selected_text):
+        selected = (selected_text or "").strip()
+        if self.inner_active_tool != "wordcraft" or not selected:
+            self._cancel_wordcraft_machine_translation_tooltip(hide=True)
+            return
+        self.wordcraft_mt_pending_text = selected
+        timer = getattr(self, "wordcraft_mt_tooltip_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._show_pending_wordcraft_machine_translation_tooltip)
+            self.wordcraft_mt_tooltip_timer = timer
+        timer.start(280)
+
+    def _show_pending_wordcraft_machine_translation_tooltip(self):
+        if self.inner_active_tool != "wordcraft" or not hasattr(self, "inner_dialog_editor"):
+            self._cancel_wordcraft_machine_translation_tooltip(hide=True)
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            timer = getattr(self, "wordcraft_mt_tooltip_timer", None)
+            if timer is not None:
+                timer.start(180)
+            return
+        token = (getattr(self, "wordcraft_mt_pending_text", "") or "").strip()
+        if not token:
+            QToolTip.hideText()
+            return
+        extra = (self.get_wordcraft_annotation_extra_translation({"selected_text": token}) or "").strip()
+        if not extra or extra == "暂无机器翻译或词条中文释义":
+            QToolTip.hideText()
+            return
+        self.wordcraft_mt_last_text = token
+        QToolTip.showText(
+            QCursor.pos() + QPoint(16, 16),
+            f"机翻/词条释义：{extra}",
+            self.inner_dialog_editor,
         )
 
     def _qt_text_pos_to_py_index(self, text, qt_pos):
@@ -2054,20 +2110,8 @@ class UserFeaturesMixin:
                 (sid, start_pos, end_pos, token),
             )
             fetched = cur.fetchall()
-            if not fetched:
-                cur.execute(
-                    "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
-                    "FROM wordcraft_annotations WHERE session_id = ? AND selected_text = ? ORDER BY id DESC",
-                    (sid, token),
-                )
-                fetched = cur.fetchall()
         else:
-            cur.execute(
-                "SELECT id, session_id, start_pos, end_pos, selected_text, annotation, created_at, updated_at "
-                "FROM wordcraft_annotations WHERE session_id = ? AND selected_text = ? ORDER BY id DESC",
-                (sid, token),
-            )
-            fetched = cur.fetchall()
+            fetched = []
         out = []
         for r in fetched:
             out.append(
@@ -2166,11 +2210,7 @@ class UserFeaturesMixin:
             return
         row = current.data(Qt.ItemDataRole.UserRole) or {}
         note = (row.get("annotation", "") or "").strip()
-        extra = self.get_wordcraft_annotation_extra_translation(row)
-        if extra:
-            self.wordcraft_annotation_window_detail.setPlainText(f"{note}\n\n【机器翻译/词条释义】\n{extra}")
-        else:
-            self.wordcraft_annotation_window_detail.setPlainText(note)
+        self.wordcraft_annotation_window_detail.setPlainText(note)
 
     def get_wordcraft_annotation_extra_translation(self, row):
         token = (row.get("selected_text", "") or "").strip()
@@ -2375,6 +2415,7 @@ class UserFeaturesMixin:
         self.wordcraft_hover_pending_pos = None
         self.wordcraft_last_hover_key = None
         self._schedule_wordcraft_annotation_close(500)
+        self._cancel_wordcraft_machine_translation_tooltip(hide=True)
 
     def add_wordcraft_pending_segment(self, text):
         token = (text or "").strip()
@@ -3852,6 +3893,8 @@ class UserFeaturesMixin:
         if not hasattr(self, "doc_content_edit") or not hasattr(self, "doc_md_preview"):
             return
         md = self.doc_content_edit.toPlainText()
+        linebreak_builder = getattr(self, "_build_note_preview_markdown", None)
+        render_md = linebreak_builder(md) if callable(linebreak_builder) else (md or "")
         c = getattr(self, "colors", {}) or {}
         text_color = c.get("text", "#ffffff")
         accent_color = c.get("accent", "#61dafb")
@@ -3861,9 +3904,9 @@ class UserFeaturesMixin:
         )
         try:
             self.doc_md_preview.document().setDefaultStyleSheet(css)
-            self.doc_md_preview.setMarkdown(md or "")
+            self.doc_md_preview.setMarkdown(render_md)
         except Exception:
-            html_fragment = self.markdown_to_html_fragment(md)
+            html_fragment = self.markdown_to_html_fragment(render_md)
             self.doc_md_preview.setHtml(html_fragment)
 
     def on_doc_mode_preview_clicked(self):
