@@ -228,6 +228,8 @@ class UserFeaturesMixin:
         self.wordcraft_mt_tooltip_timer = None
         self.wordcraft_mt_pending_text = ""
         self.wordcraft_mt_last_text = ""
+        self.wordcraft_generation_seq = 0
+        self.wordcraft_generation_inflight = {}
         self.inner_wordcraft_btn = QPushButton("选词成文")
         self.inner_wordcraft_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.inner_wordcraft_btn.setCheckable(True)
@@ -1202,6 +1204,7 @@ class UserFeaturesMixin:
             "word_count": int(cfg.get("word_count", 8) or 8),
             "difficulty": cfg.get("difficulty", "CET-4"),
             "selected_words": list(cfg.get("selected_words", [])),
+            "parallel_count": max(1, int(cfg.get("parallel_count", 1) or 1)),
         }
 
     def save_wordcraft_config(self):
@@ -2465,6 +2468,64 @@ class UserFeaturesMixin:
             days = 14
         return max(1, days)
 
+    def get_reviewing_auto_remove_step_days(self):
+        return 3
+
+    def normalize_reviewing_query_key(self, query):
+        return (query or "").strip().lower()
+
+    def get_reviewing_auto_removed_counts(self):
+        cur = self.user_conn.cursor()
+        cur.execute("SELECT query_key, auto_removed_count FROM reviewing_auto_remove_history")
+        rows = cur.fetchall()
+        counts = {}
+        for query_key, raw_count in rows:
+            key = self.normalize_reviewing_query_key(query_key)
+            if not key:
+                continue
+            try:
+                count = int(raw_count or 0)
+            except Exception:
+                count = 0
+            counts[key] = max(0, count)
+        return counts
+
+    def get_reviewing_auto_remove_days_for_query(self, query, auto_removed_counts=None):
+        base_days = self.get_reviewing_auto_remove_days()
+        key = self.normalize_reviewing_query_key(query)
+        if not key:
+            return base_days
+        counts = auto_removed_counts or {}
+        try:
+            removed_count = int(counts.get(key, 0) or 0)
+        except Exception:
+            removed_count = 0
+        removed_count = max(0, removed_count)
+        return base_days + removed_count * self.get_reviewing_auto_remove_step_days()
+
+    def record_reviewing_auto_removal(self, queries):
+        seen = set()
+        rows = []
+        ts = datetime.now().isoformat(timespec="seconds")
+        for query in queries or []:
+            key = self.normalize_reviewing_query_key(query)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append((key, ts, ts))
+        if not rows:
+            return
+        cur = self.user_conn.cursor()
+        cur.executemany(
+            "INSERT INTO reviewing_auto_remove_history(query_key, auto_removed_count, last_auto_removed_at, updated_at) "
+            "VALUES(?, 1, ?, ?) "
+            "ON CONFLICT(query_key) DO UPDATE SET "
+            "auto_removed_count = COALESCE(auto_removed_count, 0) + 1, "
+            "last_auto_removed_at = excluded.last_auto_removed_at, "
+            "updated_at = excluded.updated_at",
+            rows,
+        )
+
     def extract_english_words(self, text):
         token = (text or "").strip()
         if not token:
@@ -2487,8 +2548,8 @@ class UserFeaturesMixin:
         return False
 
     def remove_expired_reviewing_words(self):
-        days = self.get_reviewing_auto_remove_days()
-        deadline = datetime.now() - timedelta(days=days)
+        now = datetime.now()
+        auto_removed_counts = self.get_reviewing_auto_removed_counts()
         cur = self.user_conn.cursor()
         cur.execute("SELECT query, last_active_search_at, created_at FROM reviewing")
         rows = cur.fetchall()
@@ -2511,6 +2572,8 @@ class UserFeaturesMixin:
         to_remove = []
         for query, last_active_at, created_at in rows:
             active_dt = self.parse_iso_ts(last_active_at) or self.parse_iso_ts(created_at)
+            expire_days = self.get_reviewing_auto_remove_days_for_query(query, auto_removed_counts)
+            deadline = now - timedelta(days=expire_days)
             if active_dt is None or active_dt > deadline:
                 continue
             if self.is_query_covered_by_annotations(query, annotation_texts, annotation_words):
@@ -2518,6 +2581,7 @@ class UserFeaturesMixin:
             to_remove.append(((query or "").strip(),))
         if to_remove:
             cur.executemany("DELETE FROM reviewing WHERE query = ? COLLATE NOCASE", to_remove)
+            self.record_reviewing_auto_removal([x[0] for x in to_remove])
             self.user_conn.commit()
         return [x[0] for x in to_remove]
 
@@ -2592,6 +2656,54 @@ class UserFeaturesMixin:
             return chosen
         return self.sort_words_by_basis(candidates, basis, count=count)
 
+    def _build_wordcraft_word_batches(self, ordered_words, word_count, task_count):
+        pool = [str(w).strip() for w in (ordered_words or []) if str(w).strip()]
+        if not pool:
+            return []
+        count = max(1, int(word_count or 1))
+        total = max(1, int(task_count or 1))
+        size = len(pool)
+        batches = []
+        for idx in range(total):
+            start = (idx * count) % size
+            batch = [pool[(start + step) % size] for step in range(count)]
+            deduped = []
+            seen = set()
+            for token in batch:
+                low = token.lower()
+                if low in seen:
+                    continue
+                seen.add(low)
+                deduped.append(token)
+            if deduped:
+                batches.append(deduped)
+        return batches
+
+    def select_words_for_wordcraft_batches(self, cfg):
+        basis = cfg.get("basis", "recommended")
+        task_count = max(1, int(cfg.get("parallel_count", 1) or 1))
+        if basis == "self_select":
+            selected = self.select_words_for_wordcraft(cfg)
+            if not selected:
+                return []
+            return [list(selected) for _ in range(task_count)]
+        scope = cfg.get("scope", "reviewing")
+        folder_id = int(cfg.get("folder_id", 1) or 1)
+        count = max(1, int(cfg.get("word_count", 8) or 8))
+        candidates = self.get_scope_candidates(scope, folder_id)
+        if not candidates:
+            return []
+        if basis == "random":
+            ordered = [w for w, _, _ in candidates]
+            random.shuffle(ordered)
+        else:
+            ordered = self.sort_words_by_basis(candidates, basis, count=len(candidates))
+        return self._build_wordcraft_word_batches(ordered, count, task_count)
+
+    def _next_wordcraft_generation_task_id(self):
+        self.wordcraft_generation_seq = int(getattr(self, "wordcraft_generation_seq", 0) or 0) + 1
+        return int(self.wordcraft_generation_seq)
+
     def build_wordcraft_scope_options(self):
         options = [("在背单词", "reviewing", 1)]
         cur = self.user_conn.cursor()
@@ -2626,6 +2738,9 @@ class UserFeaturesMixin:
         count_spin = QSpinBox()
         count_spin.setRange(1, 30)
         count_spin.setValue(max(1, int(cfg.get("word_count", 8) or 8)))
+        parallel_spin = QSpinBox()
+        parallel_spin.setRange(1, 8)
+        parallel_spin.setValue(max(1, int(cfg.get("parallel_count", 1) or 1)))
         difficulty_combo = QComboBox()
         for d in ["高考", "CET-4", "CET-6", "考研", "专八", "GRE"]:
             difficulty_combo.addItem(d)
@@ -2666,6 +2781,7 @@ class UserFeaturesMixin:
         form.addRow("词汇范围", scope_combo)
         form.addRow("选择依据", basis_combo)
         form.addRow("串词数量", count_spin)
+        form.addRow("并行任务数", parallel_spin)
         form.addRow("难度", difficulty_combo)
         form.addRow("自选择词汇", self_select_list)
         root.addLayout(form)
@@ -2694,6 +2810,7 @@ class UserFeaturesMixin:
             "word_count": len(selected_words) if basis_value == "self_select" else int(count_spin.value()),
             "difficulty": difficulty_combo.currentText(),
             "selected_words": selected_words,
+            "parallel_count": int(parallel_spin.value()),
         }
         self.save_wordcraft_config()
 
@@ -2883,8 +3000,9 @@ class UserFeaturesMixin:
 
     def run_wordcraft_ai_generation(self):
         self.load_wordcraft_config()
-        words = self.select_words_for_wordcraft(self.wordcraft_config)
-        if not words:
+        cfg = dict(self.wordcraft_config)
+        word_batches = self.select_words_for_wordcraft_batches(cfg)
+        if not word_batches:
             QMessageBox.warning(self, "选词成文", "当前设置下没有可用词汇，请先调整设置。")
             return
         url = self.normalize_api_url(self.settings.get('api_url', ''))
@@ -2893,8 +3011,6 @@ class UserFeaturesMixin:
         if not url or not key or not model:
             QMessageBox.warning(self, "选词成文", "AI 配置不完整：请先在设置中配置 API URL、API Key 和模型。")
             return
-        prompt = self.build_wordcraft_prompt(words, self.wordcraft_config)
-        self.set_inner_markdown_preview("正在生成并审查润色，请稍候...")
         self.wordcraft_space_highlight_on = False
         self.wordcraft_show_assist_on = False
         self.wordcraft_pending_segments = []
@@ -2902,14 +3018,56 @@ class UserFeaturesMixin:
         if hasattr(self, 'inner_confirm_btn'):
             self.inner_confirm_btn.setVisible(False)
             self.inner_confirm_btn.setText("确认已选中不懂片段")
-        self.inner_wordcraft_btn.setEnabled(False)
-        threading.Thread(
-            target=self._wordcraft_worker,
-            args=(url, key, model, prompt, words, dict(self.wordcraft_config)),
-            daemon=True,
-        ).start()
+        created_sessions = []
+        total = len(word_batches)
+        launch_ts = datetime.now().strftime('%m-%d %H:%M')
+        for idx, words in enumerate(word_batches, start=1):
+            prompt = self.build_wordcraft_prompt(words, cfg)
+            header_text = f"🔊\n【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
+            session_content = header_text + "正在生成并审查润色，请稍候..."
+            session_payload = {
+                "wordcraft_config": dict(cfg),
+                "wordcraft_session": {
+                    "words": list(words),
+                    "english_clean": "",
+                    "chinese": "",
+                },
+            }
+            if total > 1:
+                title = f"选词成文 {launch_ts} [{idx}/{total}]（生成中）"
+            else:
+                title = f"选词成文 {launch_ts}（生成中）"
+            sid = self.create_inner_session(title, "wordcraft", session_content, json.dumps(session_payload, ensure_ascii=False))
+            task_id = self._next_wordcraft_generation_task_id()
+            self.wordcraft_generation_inflight[task_id] = {
+                "session_id": int(sid),
+                "task_index": int(idx),
+                "task_total": int(total),
+            }
+            created_sessions.append((sid, session_content, json.dumps(session_payload, ensure_ascii=False)))
+            threading.Thread(
+                target=self._wordcraft_worker,
+                args=(url, key, model, prompt, words, dict(cfg), int(sid), int(task_id), int(idx), int(total)),
+                daemon=True,
+            ).start()
 
-    def _wordcraft_worker(self, url, key, model, prompt, words, cfg):
+        self.load_inner_sessions()
+        if created_sessions:
+            sid, content, cfg_json = created_sessions[-1]
+            self.inner_active_tool = "wordcraft"
+            self.inner_current_session_id = int(sid)
+            self.wordcraft_session_id = int(sid)
+            self.wordcraft_last_result = self.parse_wordcraft_session_payload(content, cfg_json)
+            self.update_inner_toolbar_visual()
+            self.set_inner_markdown_preview(content)
+            self.apply_wordcraft_annotation_highlights()
+            for i in range(self.inner_session_list.count()):
+                item = self.inner_session_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == int(sid):
+                    self.inner_session_list.setCurrentItem(item)
+                    break
+
+    def _wordcraft_worker(self, url, key, model, prompt, words, cfg, session_id, task_id, task_index, task_total):
         system_prompt = prompt_text(
             self.get_ai_prompts(),
             "wordcraft_generation_system",
@@ -2965,6 +3123,10 @@ class UserFeaturesMixin:
                     "ok": True,
                     "tool": "wordcraft",
                     "stage": "generate",
+                    "session_id": int(session_id),
+                    "task_id": int(task_id),
+                    "task_index": int(task_index),
+                    "task_total": int(task_total),
                     "english": english_text,
                     "chinese": chinese_text,
                     "special_words": special_words,
@@ -2977,9 +3139,35 @@ class UserFeaturesMixin:
                 err_body = e.read().decode("utf-8", errors="ignore")
             except Exception:
                 err_body = ""
-            self.inner_tool_result_ready.emit({"ok": False, "tool": "wordcraft", "error": f"HTTP {e.code} {e.reason}\n{err_body}"})
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": False,
+                    "tool": "wordcraft",
+                    "stage": "generate",
+                    "session_id": int(session_id),
+                    "task_id": int(task_id),
+                    "task_index": int(task_index),
+                    "task_total": int(task_total),
+                    "words": words,
+                    "config": cfg,
+                    "error": f"HTTP {e.code} {e.reason}\n{err_body}",
+                }
+            )
         except Exception as e:
-            self.inner_tool_result_ready.emit({"ok": False, "tool": "wordcraft", "error": str(e)})
+            self.inner_tool_result_ready.emit(
+                {
+                    "ok": False,
+                    "tool": "wordcraft",
+                    "stage": "generate",
+                    "session_id": int(session_id),
+                    "task_id": int(task_id),
+                    "task_index": int(task_index),
+                    "task_total": int(task_total),
+                    "words": words,
+                    "config": cfg,
+                    "error": str(e),
+                }
+            )
 
     def on_inner_tool_result(self, result):
         tool = (result or {}).get("tool", "")
@@ -3003,10 +3191,45 @@ class UserFeaturesMixin:
         if stage == "explain":
             self.on_wordcraft_explain_result(result)
             return
-        if hasattr(self, 'inner_wordcraft_btn'):
-            self.inner_wordcraft_btn.setEnabled(True)
+        task_id = int((result or {}).get("task_id", 0) or 0)
+        if task_id:
+            self.wordcraft_generation_inflight.pop(task_id, None)
+        session_id = int((result or {}).get("session_id", 0) or 0)
+        task_index = int((result or {}).get("task_index", 1) or 1)
+        task_total = int((result or {}).get("task_total", 1) or 1)
         if not result.get("ok"):
-            self.set_inner_markdown_preview(f"生成失败：{result.get('error', '未知错误')}")
+            cfg = result.get("config", {}) if isinstance(result.get("config", {}), dict) else {}
+            words = result.get("words", []) if isinstance(result.get("words", []), list) else []
+            if session_id > 0:
+                title = f"选词成文 {datetime.now().strftime('%m-%d %H:%M')}"
+                if task_total > 1:
+                    title += f" [{task_index}/{task_total}]（失败）"
+                else:
+                    title += "（失败）"
+                header_text = f"🔊\n【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
+                session_content = header_text + f"生成失败：{result.get('error', '未知错误')}"
+                session_payload = {
+                    "wordcraft_config": dict(cfg),
+                    "wordcraft_session": {
+                        "words": list(words),
+                        "english_clean": "",
+                        "chinese": "",
+                    },
+                }
+                cur = self.user_conn.cursor()
+                ts = datetime.now().isoformat(timespec='seconds')
+                cur.execute(
+                    'UPDATE inner_sessions SET title = ?, content = ?, config_json = ?, updated_at = ? WHERE id = ?',
+                    (title, session_content, json.dumps(session_payload, ensure_ascii=False), ts, int(session_id)),
+                )
+                self.user_conn.commit()
+                self.load_inner_sessions()
+                if int(self.inner_current_session_id or 0) == int(session_id) and self.inner_active_tool == "wordcraft":
+                    self.set_inner_markdown_preview(session_content)
+                    self.wordcraft_last_result = self.parse_wordcraft_session_payload(session_content, json.dumps(session_payload, ensure_ascii=False))
+                    self.apply_wordcraft_annotation_highlights()
+            else:
+                self.set_inner_markdown_preview(f"生成失败：{result.get('error', '未知错误')}")
             return
         words = result.get("words", [])
         cfg = result.get("config", {})
@@ -3030,18 +3253,10 @@ class UserFeaturesMixin:
                 seen.add(low)
                 deduped.append(words_lower.get(low, token))
             special_words = deduped
-        self.wordcraft_last_result = {
-            "words": words,
-            "config": cfg,
-            "english_raw": english_raw,
-            "english_clean": english_clean,
-            "chinese": chinese_clean,
-            "special_words": special_words,
-        }
-        self.update_inner_toolbar_visual()
-        self.refresh_wordcraft_display()
         self.touch_words_query_time(words)
         title = f"选词成文 {datetime.now().strftime('%m-%d %H:%M')}"
+        if task_total > 1:
+            title += f" [{task_index}/{task_total}]"
         header_text = f"🔊\n【选词成文】\n词汇：{', '.join(words)}\n难度：{cfg.get('difficulty', 'CET-4')}\n\n"
         session_content = header_text + english_clean + f"\n\n【中文】\n{chinese_clean}"
         session_payload = {
@@ -3052,17 +3267,40 @@ class UserFeaturesMixin:
                 "chinese": chinese_clean,
             },
         }
-        sid = self.create_inner_session(title, "wordcraft", session_content, json.dumps(session_payload, ensure_ascii=False))
-        self.wordcraft_session_id = sid
-        self.inner_current_session_id = sid
+        sid = int(session_id or 0)
+        cur = self.user_conn.cursor()
+        ts = datetime.now().isoformat(timespec='seconds')
+        if sid > 0:
+            cur.execute(
+                'UPDATE inner_sessions SET title = ?, content = ?, config_json = ?, updated_at = ? WHERE id = ?',
+                (title, session_content, json.dumps(session_payload, ensure_ascii=False), ts, sid),
+            )
+            if cur.rowcount <= 0:
+                sid = 0
+        if sid <= 0:
+            sid = self.create_inner_session(title, "wordcraft", session_content, json.dumps(session_payload, ensure_ascii=False))
+        else:
+            self.user_conn.commit()
         self.load_inner_sessions()
-        for i in range(self.inner_session_list.count()):
+        if int(self.inner_current_session_id or 0) == int(sid) and self.inner_active_tool == "wordcraft":
+            self.wordcraft_session_id = sid
+            self.wordcraft_last_result = {
+                "words": words,
+                "config": cfg,
+                "english_raw": english_raw,
+                "english_clean": english_clean,
+                "chinese": chinese_clean,
+                "special_words": special_words,
+            }
+            self.update_inner_toolbar_visual()
+            self.refresh_wordcraft_display()
+            for i in range(self.inner_session_list.count()):
                 item = self.inner_session_list.item(i)
                 if item.data(Qt.ItemDataRole.UserRole) == sid:
                     self.inner_session_list.setCurrentItem(item)
                     break
-        if hasattr(self, "inner_confirm_btn"):
-            self.inner_confirm_btn.setVisible(False)
+            if hasattr(self, "inner_confirm_btn"):
+                self.inner_confirm_btn.setVisible(False)
 
     def append_wordcraft_chinese_and_save(self):
         english_clean = self.wordcraft_last_result.get("english_clean", "")

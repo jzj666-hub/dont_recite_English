@@ -55,6 +55,13 @@ class BootstrapMixin:
             "last_active_search_at TEXT)"
         )
         cur.execute(
+            "CREATE TABLE IF NOT EXISTS reviewing_auto_remove_history ("
+            "query_key TEXT PRIMARY KEY, "
+            "auto_removed_count INTEGER DEFAULT 0, "
+            "last_auto_removed_at TEXT, "
+            "updated_at TEXT)"
+        )
+        cur.execute(
             "CREATE TABLE IF NOT EXISTS word_links ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "word_a TEXT NOT NULL, "
